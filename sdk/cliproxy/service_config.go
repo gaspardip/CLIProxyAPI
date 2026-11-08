@@ -208,6 +208,12 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 		log.WithError(errValidate).Warn("rejected invalid model catalog sources")
 		return configCommit{}
 	}
+	if s.hooks.ValidateConfig != nil {
+		if errValidate := s.hooks.ValidateConfig(newCfg.CloneForRuntime()); errValidate != nil {
+			log.WithError(errValidate).Warn("rejected config update with invalid application settings")
+			return configCommit{}
+		}
+	}
 	var prepared *preparedRoutingSelector
 	if s.selectorFactory != nil && s.coreManager != nil {
 		routingState := normalizedRoutingRuntimeState(newCfg)
