@@ -171,3 +171,14 @@ hook does not make those paths obey the policy. Disable them in an application
 that relies on the selector to enforce spending rules. Also account for retry
 candidate narrowing: never infer global quota exhaustion solely from a retry's
 remaining candidates.
+
+Applications can use `Hooks.ValidateConfig` to reject unsafe configuration on
+startup, every reload, and management saves before configuration is persisted or
+published, including changes unrelated to routing. Rejected legacy mutations
+restore the handler's last accepted snapshot. Without a validator, management
+behavior is unchanged. This guards configuration, not earlier plugin-file installation
+or deletion side effects. Validation
+receives a snapshot, must not mutate service state or perform blocking runtime
+work, and must return an error to reject the update before publication. For
+example, an embedding application can require API keys, a private bind address,
+and disabled scheduler plugins for its quota policy.
