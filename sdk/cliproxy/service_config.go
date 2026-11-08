@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/synthesizer"
@@ -216,6 +217,12 @@ func (s *Service) commitConfigUpdate(newCfg *config.Config) configCommit {
 		log.WithError(errValidate).Warn("rejected invalid model catalog sources")
 		return configCommit{}
 	}
+	if s.hooks.ValidateConfig != nil {
+		if errValidate := s.hooks.ValidateConfig(newCfg.CloneForRuntime()); errValidate != nil {
+			log.WithError(errValidate).Warn("rejected config update with invalid application settings")
+			return configCommit{}
+		}
+	}
 	var prepared *preparedRoutingSelector
 	if s.selectorFactory != nil && s.coreManager != nil {
 		routingState := normalizedRoutingRuntimeState(newCfg)
@@ -399,6 +406,15 @@ func (s *Service) updateServerClientsContext(ctx context.Context, cfg *config.Co
 	return s.server.UpdateClientsContext(ctx, cfg)
 }
 
+// reloadConfigAfterManagementSave reloads config from disk after a management write.
+func (s *Service) reloadConfigAfterManagementSave(ctx context.Context) {
+	if management.ForcedConfigReload(ctx) {
+		s.currentWatcher().ReloadConfig()
+		return
+	}
+	s.reloadConfigFromWatcher()
+}
+
 func (s *Service) reloadConfigFromWatcher() bool {
 	w := s.currentWatcher()
 	if w == nil {
@@ -450,19 +466,4 @@ func (s *Service) registerConfigAPIKeyAuths(ctx context.Context, cfg *config.Con
 		s.coreManager.RefreshAPIKeyModelAlias()
 	}
 	s.runModelRegistrationTasks(registrationCtx, tasks)
-}
-
-func forceHomeRuntimeConfig(cfg *config.Config) {
-	if cfg == nil {
-		return
-	}
-	cfg.APIKeys = nil
-	cfg.UsageStatisticsEnabled = true
-	cfg.DisableCooling = true
-	cfg.SaveCooldownStatus = false
-	cfg.WebsocketAuth = true
-	cfg.RemoteManagement.AllowRemote = false
-	cfg.RemoteManagement.DisableControlPanel = true
-	cfg.Plugins.StoreAuth = nil
-	cfg.KVStore.Disabled = true
 }
