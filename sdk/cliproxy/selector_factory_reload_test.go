@@ -1,12 +1,18 @@
 package cliproxy
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
@@ -63,5 +69,68 @@ func TestSelectorFactoryRejectsWatcherReloadBeforeAdoption(t *testing.T) {
 	}
 	if service.coreManager.Selector() == running || running.stops.Load() != 1 {
 		t.Fatal("accepted retry did not replace the previous selector")
+	}
+}
+
+// A management save the selector factory rejects fails before it reaches disk.
+func TestSelectorFactoryRejectsManagementSaveBeforeWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("host: 127.0.0.1\nport: 8317\napi-keys: [client]\nremote-management: {secret-key: test-password}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AuthDir = t.TempDir()
+	installed := &factoryOwnedSelector{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	service, err := NewBuilder().WithConfig(cfg).WithConfigPath(path).WithCoreAuthManager(manager).
+		WithSelectorFactory(func(c *config.Config) (coreauth.Selector, error) {
+			if c.Routing.Strategy == "fill-first" {
+				return nil, errors.New("fill-first policy unavailable")
+			}
+			return installed, nil
+		}).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := append([]api.ServerOption(nil), service.serverOptions...)
+	options = append(options, api.WithLocalManagementPassword("test-password"))
+	server := api.NewServer(cfg, nil, nil, path, options...)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := server.Stop(ctx); err != nil {
+			t.Errorf("stop API fixture: %v", err)
+		}
+		if err := service.Shutdown(ctx); err != nil {
+			t.Errorf("stop service fixture: %v", err)
+		}
+	})
+	request := func(method, target, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set("Authorization", "Bearer test-password")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, req)
+		return response
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := request(http.MethodPatch, "/v8/management/config", `{"routing":{"strategy":"fill-first"}}`); response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("management saved a config the selector factory rejects: %d %s", response.Code, response.Body.String())
+	}
+	if after, errRead := os.ReadFile(path); errRead != nil || string(after) != string(before) {
+		t.Fatalf("rejected save changed the config file: %q %v", after, errRead)
+	}
+	if response := request(http.MethodGet, "/v8/management/config/routing/strategy", ""); strings.Contains(response.Body.String(), "fill-first") {
+		t.Fatalf("rejected save changed management state: %s", response.Body.String())
+	}
+	if manager.Selector() != installed || installed.stops.Load() != 0 {
+		t.Fatal("rejected save replaced or stopped the running selector")
 	}
 }
