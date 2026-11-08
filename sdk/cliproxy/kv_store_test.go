@@ -129,9 +129,9 @@ func TestServiceApplyKVStoreConfig_HomeModeNeverOpensBBolt(t *testing.T) {
 		Home:    config.HomeConfig{Enabled: true},
 		KVStore: config.KVStoreConfig{Disabled: false, Path: dbPath},
 	}
-	forceHomeRuntimeConfig(cfg)
+	config.ForceHomeRuntimeConfig(cfg)
 	if !cfg.KVStore.Disabled {
-		t.Fatal("forceHomeRuntimeConfig did not set KVStore.Disabled = true")
+		t.Fatal("ForceHomeRuntimeConfig did not set KVStore.Disabled = true")
 	}
 
 	svc := &Service{}
