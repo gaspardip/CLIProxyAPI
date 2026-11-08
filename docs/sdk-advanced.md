@@ -136,3 +136,38 @@ The embedded server calls this automatically for built‑in providers; for custo
 - Toggle debug logs: Management API GET/PUT `/v0/management/debug`
 - Hot reload changes in `config.yaml` and `auths/` are picked up automatically by the watcher
 
+
+## Custom account routing (v8)
+
+`Builder.WithSelectorFactory` owns selector construction at startup and when
+normalized routing settings change. It overrides the selector even when a core
+auth manager is injected. Unrelated config reloads retain the existing selector
+and session bindings. A factory error or nil result rejects a routing config
+update before publication.
+
+```go
+builder.WithSelectorFactory(func(cfg *config.Config) (coreauth.Selector, error) {
+    return cliproxy.NewRoutingSelector(cfg, quotaPolicy), nil
+})
+```
+
+The factory receives an isolated configuration snapshot and must return a fresh,
+service-owned selector. Construction must not perform networking or other blocking
+runtime work. Keep quota collection and the lifetime of shared policy state in
+the embedding application. The service stops discarded or replaced selectors that
+implement `auth.StoppableSelector`; native affinity owns its cache, not the
+lifetime of its fallback policy.
+
+`NewRoutingSelector(cfg, fallback)` applies native affinity options around the
+custom account policy. A nil fallback selects the configured built-in strategy.
+A policy implementing `auth.CandidateFilter` can additionally remove candidates
+before affinity looks up explicit, parent/subagent, or longest-prefix bindings.
+Filter errors abort selection. This lets an application exclude paid accounts
+when included quota becomes available, even for previously bound sessions.
+Filters must return a subset of their input candidates.
+
+Scheduler plugins and Home dispatch have separate routing paths. This selector
+hook does not make those paths obey the policy. Disable them in an application
+that relies on the selector to enforce spending rules. Also account for retry
+candidate narrowing: never infer global quota exhaustion solely from a retry's
+remaining candidates.
