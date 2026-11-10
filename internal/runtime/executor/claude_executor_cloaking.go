@@ -41,7 +41,12 @@ func resolveIncomingClaudeHeaders(ctx context.Context, incoming http.Header) htt
 
 func detectIncomingClaudeCodeRequest(ctx context.Context, incoming http.Header, payload []byte, countTokens bool, cfg *config.Config) (http.Header, helps.ClaudeCodeRequestDetection) {
 	resolved := resolveIncomingClaudeHeaders(ctx, incoming)
-	return resolved, helps.DetectClaudeCodeRequest(resolved, payload, countTokens, cfg)
+	detection := helps.DetectClaudeCodeRequest(resolved, payload, countTokens, cfg)
+	// Recorded before cloaking so the billing header and User-Agent agree, cloaked or not.
+	if detection.Confirmed {
+		helps.ObserveClaudeCLIUserAgent(resolved.Get("User-Agent"), cfg)
+	}
+	return resolved, detection
 }
 
 // getWorkloadFromContext extracts workload identifier from the gin request headers.

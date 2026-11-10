@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.280 (external, cli)"
+	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.321 (external, cli)"
 	defaultClaudeFingerprintPackageVersion = "0.112.1"
 	defaultClaudeFingerprintRuntimeVersion = "v26.3.0"
 	defaultClaudeFingerprintOS             = "MacOS"
@@ -28,6 +28,10 @@ const (
 	claudeDeviceProfileTTL                 = 7 * 24 * time.Hour
 	claudeDeviceProfileLockTTL             = 5 * time.Second
 	claudeDeviceProfileCleanupPeriod       = time.Hour
+
+	// measuredClaudeCodeUserAgent is the release whose wire shape detection was
+	// measured against; it and newer patches in its line count as Claude Code.
+	measuredClaudeCodeUserAgent = "claude-cli/2.1.280 (external, cli)"
 )
 
 var (
@@ -40,6 +44,13 @@ var (
 	claudeDeviceProfileCacheCleanupOnce sync.Once
 
 	ClaudeDeviceProfileBeforeCandidateStore func(ClaudeDeviceProfile)
+
+	// newestClaudeCLIVersion is the newest version a confirmed Claude Code client
+	// sent. Memory only: it resets on restart.
+	newestClaudeCLIVersion   claudeCLIVersion
+	newestClaudeCLIVersionMu sync.RWMutex
+
+	builtInClaudeCLIVersion, _ = parseClaudeCLIVersion(defaultClaudeFingerprintUserAgent)
 )
 
 type claudeDeviceProfileKVClient interface {
@@ -115,6 +126,52 @@ func ResetClaudeDeviceProfileCache() {
 	claudeDeviceProfileCacheMu.Lock()
 	claudeDeviceProfileCache = make(map[string]claudeDeviceProfileCacheEntry)
 	claudeDeviceProfileCacheMu.Unlock()
+	newestClaudeCLIVersionMu.Lock()
+	newestClaudeCLIVersion = claudeCLIVersion{}
+	newestClaudeCLIVersionMu.Unlock()
+}
+
+// ObserveClaudeCLIUserAgent records a confirmed Claude Code client's version so
+// the outgoing User-Agent never trails a real client. Anthropic rejects models
+// newer than the Claude Code version on the wire.
+func ObserveClaudeCLIUserAgent(userAgent string, cfg *config.Config) {
+	if !plausibleClaudeCodeUserAgent(userAgent, cfg) {
+		return
+	}
+	version, _ := parseClaudeCLIVersion(userAgent)
+	newestClaudeCLIVersionMu.Lock()
+	if version.Compare(newestClaudeCLIVersion) > 0 {
+		newestClaudeCLIVersion = version
+	}
+	newestClaudeCLIVersionMu.Unlock()
+}
+
+// claudeFingerprintUserAgent sends the highest of the configured User-Agent, the
+// built-in default and the newest confirmed client, keeping the configured
+// string's suffix. An unparseable configured value is sent verbatim.
+func claudeFingerprintUserAgent(configured string) string {
+	userAgent := strings.TrimSpace(configured)
+	if userAgent == "" {
+		userAgent = defaultClaudeFingerprintUserAgent
+	}
+	best, ok := parseClaudeCLIVersion(userAgent)
+	if !ok {
+		return userAgent
+	}
+	newestClaudeCLIVersionMu.RLock()
+	newest := newestClaudeCLIVersion
+	newestClaudeCLIVersionMu.RUnlock()
+	if builtInClaudeCLIVersion.Compare(best) > 0 {
+		best = builtInClaudeCLIVersion
+	}
+	if newest.Compare(best) > 0 {
+		best = newest
+	}
+	return claudeCLIVersionPattern.ReplaceAllLiteralString(userAgent, "claude-cli/"+best.String())
+}
+
+func (v claudeCLIVersion) String() string {
+	return strconv.Itoa(v.major) + "." + strconv.Itoa(v.minor) + "." + strconv.Itoa(v.patch)
 }
 
 func MapStainlessOS() string {
@@ -125,7 +182,19 @@ func MapStainlessArch() string {
 	return mapStainlessArch()
 }
 
+// defaultClaudeDeviceProfile is the outgoing baseline: the measured profile with
+// the User-Agent raised to the newest confirmed client or built-in default.
 func defaultClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
+	var configured string
+	if cfg != nil {
+		configured = cfg.ClaudeHeaderDefaults.UserAgent
+	}
+	return withClaudeUserAgent(measuredClaudeDeviceProfile(cfg), claudeFingerprintUserAgent(configured))
+}
+
+// measuredClaudeDeviceProfile is the configured or measured client tuple that
+// detection compares incoming requests against.
+func measuredClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
 	hdrDefault := func(cfgVal, fallback string) string {
 		if strings.TrimSpace(cfgVal) != "" {
 			return strings.TrimSpace(cfgVal)
@@ -138,17 +207,17 @@ func defaultClaudeDeviceProfile(cfg *config.Config) ClaudeDeviceProfile {
 		hd = cfg.ClaudeHeaderDefaults
 	}
 
-	profile := ClaudeDeviceProfile{
-		UserAgent:      hdrDefault(hd.UserAgent, defaultClaudeFingerprintUserAgent),
+	return withClaudeUserAgent(ClaudeDeviceProfile{
 		PackageVersion: hdrDefault(hd.PackageVersion, defaultClaudeFingerprintPackageVersion),
 		RuntimeVersion: hdrDefault(hd.RuntimeVersion, defaultClaudeFingerprintRuntimeVersion),
 		OS:             hdrDefault(hd.OS, defaultClaudeFingerprintOS),
 		Arch:           hdrDefault(hd.Arch, defaultClaudeFingerprintArch),
-	}
-	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
-		profile.version = version
-		profile.hasVersion = true
-	}
+	}, hdrDefault(hd.UserAgent, measuredClaudeCodeUserAgent))
+}
+
+func withClaudeUserAgent(profile ClaudeDeviceProfile, userAgent string) ClaudeDeviceProfile {
+	profile.UserAgent = userAgent
+	profile.version, profile.hasVersion = parseClaudeCLIVersion(userAgent)
 	return profile
 }
 
@@ -638,14 +707,13 @@ func ApplyClaudeDeviceProfileHeaders(r *http.Request, profile ClaudeDeviceProfil
 	r.Header.Set("X-Stainless-Arch", profile.Arch)
 }
 
-// DefaultClaudeVersion returns the version string (e.g. "2.1.280") from the
-// current baseline device profile. It extracts the version from the User-Agent.
+// DefaultClaudeVersion returns the outgoing Claude Code version (e.g. "2.1.321"),
+// the same one the outgoing User-Agent carries.
 func DefaultClaudeVersion(cfg *config.Config) string {
-	profile := defaultClaudeDeviceProfile(cfg)
-	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
-		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
+	if profile := defaultClaudeDeviceProfile(cfg); profile.hasVersion {
+		return profile.version.String()
 	}
-	return "2.1.280"
+	return builtInClaudeCLIVersion.String()
 }
 
 func ApplyClaudeDefaultDeviceProfileHeaders(r *http.Request, cfg *config.Config) {
