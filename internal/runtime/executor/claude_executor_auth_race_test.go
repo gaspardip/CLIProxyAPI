@@ -24,6 +24,47 @@ func newSharedClaudeOAuthAuth(id string) *cliproxyauth.Auth {
 	}
 }
 
+func TestIsClaudeSetupTokenMetadataFlagsRaceFree(t *testing.T) {
+	for _, key := range []string{"skip_account_profile", "is_setup_token", "setup_token"} {
+		for _, testCase := range []struct {
+			name     string
+			metadata map[string]any
+			want     bool
+		}{
+			{name: "nil metadata"},
+			{name: "missing", metadata: map[string]any{}},
+			{name: "true", metadata: map[string]any{key: true}, want: true},
+			{name: "false", metadata: map[string]any{key: false}},
+			{name: "string", metadata: map[string]any{key: "true"}},
+			{name: "number", metadata: map[string]any{key: 1}},
+			{name: "nil value", metadata: map[string]any{key: nil}},
+		} {
+			t.Run(key+"/"+testCase.name, func(t *testing.T) {
+				auth := &cliproxyauth.Auth{Metadata: testCase.metadata}
+				start := make(chan struct{})
+				var wg sync.WaitGroup
+				wg.Go(func() {
+					<-start
+					for range 100 {
+						claudeauth.StoreMetadataString(&auth.Metadata, "account_uuid", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+					}
+				})
+				wg.Go(func() {
+					<-start
+					for range 100 {
+						if got := isClaudeSetupToken(auth, "sk-ant-oat-race-probe"); got != testCase.want {
+							t.Errorf("isClaudeSetupToken() = %v, want %v", got, testCase.want)
+							return
+						}
+					}
+				})
+				close(start)
+				wg.Wait()
+			})
+		}
+	}
+}
+
 func TestClaudeExecutorPrepareRequestAuthIsRaceFreeOnSharedCredential(t *testing.T) {
 	executor := NewClaudeExecutor(&config.Config{})
 	executor.oauthProfileFetcher = func(context.Context, *cliproxyauth.Auth, string) (*claudeauth.OAuthProfile, error) {
