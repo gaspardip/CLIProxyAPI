@@ -673,6 +673,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
+			if errPolicy := m.validateDispatchAuth(execCtx, routeModel, execOpts, auth); errPolicy != nil {
+				return cliproxyexecutor.Response{}, errPolicy
+			}
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
@@ -691,6 +694,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
+					if errPolicy := m.validateDispatchAuth(execCtx, routeModel, execOpts, auth); errPolicy != nil {
+						return cliproxyexecutor.Response{}, errPolicy
+					}
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
 					errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 					durationRetry := time.Since(startRetry)
@@ -891,6 +897,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
+			if errPolicy := m.validateDispatchAuth(execCtx, routeModel, execOpts, auth); errPolicy != nil {
+				return cliproxyexecutor.Response{}, errPolicy
+			}
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
@@ -909,6 +918,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
+					if errPolicy := m.validateDispatchAuth(execCtx, routeModel, execOpts, auth); errPolicy != nil {
+						return cliproxyexecutor.Response{}, errPolicy
+					}
 					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
 					errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 					durationRetry := time.Since(startRetry)

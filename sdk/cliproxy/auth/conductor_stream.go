@@ -438,6 +438,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 		executionSeq := m.nextExecutionSeq()
 		startStream := time.Now()
+		if errPolicy := m.validateDispatchAuth(ctx, routeModel, execOpts, auth); errPolicy != nil {
+			return nil, errPolicy
+		}
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 		errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 		if hasUpstreamExecutionAttempt(errStream) {
@@ -460,6 +463,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					ctx = syncMetadataSessionToContext(ctx, execOpts.Metadata)
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
+					if errPolicy := m.validateDispatchAuth(ctx, routeModel, execOpts, auth); errPolicy != nil {
+						return nil, errPolicy
+					}
 					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					errStream = markUpstreamExecutionAttemptFromContext(ctx, errStream)
 					if hasUpstreamExecutionAttempt(errStream) {
@@ -541,6 +547,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 					ctx = newUpstreamAttemptContext(ctx)
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
+					if errPolicy := m.validateDispatchAuth(ctx, routeModel, execOpts, auth); errPolicy != nil {
+						return nil, errPolicy
+					}
 					retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
 					retryErr = markUpstreamExecutionAttemptFromContext(ctx, retryErr)
 					retryStream, retryErr = validateStreamResult(retryStream, retryErr)

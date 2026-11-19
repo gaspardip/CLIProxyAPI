@@ -1168,6 +1168,14 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 	return cliproxysession.NewInMemorySessionTreeStore(0, time.Hour)
 }
 
+// FilterCandidates forwards policy admission without changing affinity bindings.
+func (s *SessionAffinitySelector) FilterCandidates(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) ([]*Auth, error) {
+	if filter, ok := s.fallback.(CandidateFilter); ok {
+		return filter.FilterCandidates(ctx, provider, model, opts, auths)
+	}
+	return auths, nil
+}
+
 // Pick selects an auth with session affinity when possible.
 // Explicit Claude Code, Codex, OpenCode, pi, and request-body session signals
 // are absolute authority. Requests without those signals use the Merkle LCP

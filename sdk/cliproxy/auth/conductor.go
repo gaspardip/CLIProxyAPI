@@ -109,7 +109,8 @@ type Selector interface {
 }
 
 // CandidateFilter is an optional selector capability used by native session
-// affinity before cache lookup. It must return a subset of the supplied accounts.
+// affinity before cache lookup and by local execution immediately before dispatch,
+// including after preparation and 401 refresh. It must return a subset of the supplied accounts.
 // Errors abort selection; excluded accounts cannot be reused by affinity.
 type CandidateFilter interface {
 	FilterCandidates(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) ([]*Auth, error)
