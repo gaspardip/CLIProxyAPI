@@ -13,6 +13,7 @@ import (
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/client"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
 	gitindex "github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
@@ -1144,6 +1145,24 @@ func TestGitRecoveryRefreshesConfigChangesAndConflicts(t *testing.T) {
 						}
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestRecoveryRequiresRealTraversalDirectories(t *testing.T) {
+	for _, path := range []string{"component", "component/child"} {
+		t.Run(path, func(t *testing.T) {
+			clone := t.TempDir()
+			if err := os.Mkdir(filepath.Join(clone, "ordinary"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("ordinary", filepath.Join(clone, "component")); err != nil {
+				t.Fatal(err)
+			}
+			entries := []*gitindex.Entry{{Name: path, Mode: filemode.Dir}}
+			if err := applyRecoveryLocalChanges(t.TempDir(), clone, nil, entries); err == nil {
+				t.Fatal("accepted symlink in required traversal directory")
 			}
 		})
 	}

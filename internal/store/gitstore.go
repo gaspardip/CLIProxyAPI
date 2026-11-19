@@ -1695,9 +1695,32 @@ pathsLoop:
 	// Git has no empty directories, but resolving a link through dir/.. needs dir.
 	for _, entry := range configEntries {
 		if entry.Mode == filemode.Dir {
-			if err := targetRoot.MkdirAll(filepath.FromSlash(entry.Name), 0o700); err != nil {
+			if err := ensureRecoveryTraversalDir(targetRoot, entry.Name); err != nil {
 				return fmt.Errorf("preserve config traversal directory %s: %w", entry.Name, err)
 			}
+		}
+	}
+	return nil
+}
+
+// Each component is a resolved directory in the original worktree.
+func ensureRecoveryTraversalDir(root *os.Root, name string) error {
+	var path string
+	for part := range strings.SplitSeq(name, "/") {
+		path = filepath.Join(path, part)
+		err := root.Mkdir(path, 0o700)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		info, err := root.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", path)
 		}
 	}
 	return nil
