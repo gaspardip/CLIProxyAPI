@@ -3346,12 +3346,23 @@ func (s *claudeStreamDocScanner) Write(p []byte) (int, error) {
 		s.capStart = 0
 	}
 	i := 0
+	nextQuote := -1
 	for i < len(p) {
 		switch s.tok {
 		case claudeScanTokString:
 			if s.strEsc == 0 && (s.strTarget == claudeStrIgnore || (s.strTarget == claudeStrCheckNonSpace && s.strHasNonSpace)) {
-				for i < len(p) && p[i] != '"' && p[i] != '\\' {
-					i++
+				// Cache the next quote so escape-heavy strings do not repeatedly
+				// search the same suffix. Bulk searches avoid per-byte scan overhead.
+				if nextQuote < i {
+					nextQuote = len(p)
+					if offset := bytes.IndexByte(p[i:], '"'); offset >= 0 {
+						nextQuote = i + offset
+					}
+				}
+				if offset := bytes.IndexByte(p[i:nextQuote], '\\'); offset >= 0 {
+					i += offset
+				} else {
+					i = nextQuote
 				}
 				if i >= len(p) {
 					break

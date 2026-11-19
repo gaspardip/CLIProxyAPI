@@ -519,6 +519,7 @@ func TestClaudeCacheControlDocChecksDoNotMaterializeLargeMessagesArray(t *testin
 		runtime.ReadMemStats(&mAfter)
 
 		allocated := mAfter.TotalAlloc - mBefore.TotalAlloc
+		t.Logf("split messages: elapsed=%v allocated=%d bytes", elapsed, allocated)
 		if allocated > 64*1024 {
 			t.Fatalf("split messages: cache control doc helpers allocated %d bytes (> 64 KiB)", allocated)
 		}
@@ -563,6 +564,7 @@ func TestClaudeCacheControlDocChecksDoNotMaterializeLargeMessagesArray(t *testin
 		runtime.ReadMemStats(&mAfter)
 
 		allocated := mAfter.TotalAlloc - mBefore.TotalAlloc
+		t.Logf("unsplit 1024 messages: elapsed=%v allocated=%d bytes", elapsed, allocated)
 		if allocated > 64*1024 {
 			t.Fatalf("unsplit 1024 messages: allocated %d bytes (> 64 KiB)", allocated)
 		}
