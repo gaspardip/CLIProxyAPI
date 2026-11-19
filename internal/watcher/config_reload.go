@@ -5,7 +5,6 @@ package watcher
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"os"
 	"reflect"
 	"time"
 
@@ -66,7 +65,7 @@ func (w *Watcher) reloadConfigFromDisk(force bool) {
 	w.configApplyMu.Lock()
 	defer w.configApplyMu.Unlock()
 
-	data, err := os.ReadFile(w.configPath)
+	data, err := config.ReadConfigFile(w.configPath)
 	if err != nil {
 		log.Errorf("failed to read config file for hash check: %v", err)
 		return
@@ -106,6 +105,8 @@ func (w *Watcher) reloadConfig() bool {
 	log.Debug("=========================== CONFIG RELOAD ============================")
 	log.Debugf("starting config reload from: %s", w.configPath)
 
+	// LoadConfig holds the shared file gate through parsing and loader rewrites,
+	// then releases it before validation and runtime callbacks can save again.
 	newConfig, errLoadConfig := loadConfigFileFunc(w.configPath)
 	if errLoadConfig != nil {
 		log.Errorf("failed to reload config: %v", errLoadConfig)

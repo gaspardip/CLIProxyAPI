@@ -192,7 +192,17 @@ Recoverable failures retain the previous disk bytes, management runtime snapshot
 permissions and links are preserved. If restoration or cleanup also fails, the
 returned error explicitly reports that on-disk state is uncertain.
 
-This in-place write is not atomic for independent readers or writers. A process
+The built-in watcher and supported config helpers share an in-process file I/O
+gate. The watcher cannot read an in-progress candidate until the writer finishes
+sync and close, including restoration on failure. Its validation and runtime
+callbacks run after releasing that gate, so they can use config helpers without
+reentering the file lock. Existing reload ordering still serializes publication;
+a later successful save or external edit remains eligible for reload. The gate
+also covers `sdk/config` loads and comment-preserving saves, loader rewrites, and
+management reads. It preserves those helpers' existing error and recovery behavior.
+
+This in-place write is not atomic for independent processes or direct filesystem
+access that bypasses the supported config helpers. A process
 crash, power loss, or persistent storage failure can prevent recovery; no durability
 or runtime isolation across those failures is guaranteed. A detected replacement
 inode is left untouched and reported as a restoration failure.

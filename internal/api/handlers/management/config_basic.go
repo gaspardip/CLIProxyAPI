@@ -139,9 +139,13 @@ var openConfigWriteFile = func(path string, flag int, perm os.FileMode) (configW
 	return os.OpenFile(path, flag, perm)
 }
 
-// Keep the inode for mounts and watchers. Restoration is best effort, not an
-// atomic replacement: readers may observe writes, and storage can fail again.
+// Keep the inode for mounts and hold the file gate through Close and restoration,
+// so the built-in watcher cannot read a candidate before the save commits.
 func writePreparedConfig(path string, data []byte) error {
+	return config.WithFileAccess(func() error { return writePreparedConfigUnlocked(path, data) })
+}
+
+func writePreparedConfigUnlocked(path string, data []byte) error {
 	f, err := openConfigWriteFile(path, os.O_RDWR, 0)
 	created := false
 	if os.IsNotExist(err) {
@@ -155,7 +159,7 @@ func writePreparedConfig(path string, data []byte) error {
 			if !filepath.IsAbs(target) {
 				target = filepath.Dir(path) + string(os.PathSeparator) + target
 			}
-			return writePreparedConfig(target, data)
+			return writePreparedConfigUnlocked(target, data)
 		}
 		created = err == nil
 	}
@@ -300,7 +304,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 // GetConfigYAML returns the raw config.yaml file bytes without re-encoding.
 // It preserves comments and original formatting/styles.
 func (h *Handler) GetConfigYAML(c *gin.Context) {
-	data, err := os.ReadFile(h.configFilePath)
+	data, err := config.ReadConfigFile(h.configFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not_found", "message": "config file not found"})

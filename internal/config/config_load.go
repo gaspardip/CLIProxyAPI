@@ -41,6 +41,10 @@ func ComputeSourceHash(data []byte) string {
 // copies stay identical. When the plaintext cannot be removed it returns an error and
 // leaves configFile untouched, so every later attempt refuses the file again.
 func PrepareConfigFileForUpload(configFile string) error {
+	return WithFileAccess(func() error { return prepareConfigFileForUpload(configFile) })
+}
+
+func prepareConfigFileForUpload(configFile string) error {
 	data, errRead := os.ReadFile(configFile)
 	if errRead != nil {
 		return errRead
@@ -164,7 +168,15 @@ func LoadConfigForSave(configFile string) (*Config, error) {
 	return loadConfigOptional(configFile, false, true)
 }
 
-func loadConfigOptional(configFile string, optional, requireSecretPersistence bool) (*Config, error) {
+func loadConfigOptional(configFile string, optional, requireSecretPersistence bool) (cfg *Config, err error) {
+	err = WithFileAccess(func() error {
+		cfg, err = loadConfigOptionalUnlocked(configFile, optional, requireSecretPersistence)
+		return err
+	})
+	return cfg, err
+}
+
+func loadConfigOptionalUnlocked(configFile string, optional, requireSecretPersistence bool) (*Config, error) {
 	// Read the entire configuration file into memory.
 	data, err := os.ReadFile(configFile)
 	if err != nil {
@@ -266,7 +278,7 @@ func loadConfigOptional(configFile string, optional, requireSecretPersistence bo
 		// Preserve YAML comments and ordering; update only the nested key.
 		// Startup can use the in-memory hash with a read-only config. A staged
 		// save must instead fail so it cannot publish bytes without that hash.
-		if errSave := SaveConfigPreserveCommentsUpdateNestedScalar(configFile, managementSecretKeyPath(data), hashed); errSave != nil && requireSecretPersistence {
+		if errSave := saveConfigPreserveCommentsUpdateNestedScalar(configFile, managementSecretKeyPath(data), hashed); errSave != nil && requireSecretPersistence {
 			return nil, fmt.Errorf("failed to persist remote management key hash: %w", errSave)
 		}
 	}

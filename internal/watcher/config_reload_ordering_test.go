@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -179,4 +180,39 @@ func TestReloadConfigIfChangedReloadsAfterWriteBetweenHashAndLoad_Issue6631(t *t
 	if want := []int{2, 1}; !reflect.DeepEqual(applied, want) {
 		t.Fatalf("applied request-retry values = %v, want %v", applied, want)
 	}
+}
+
+func TestReloadConfigCallbacksCanSave(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		path, authDir := newIssue6631ConfigFile(t)
+		if err := writeIssue6631Config(path, authDir, 1); err != nil {
+			t.Fatal(err)
+		}
+		var applied []int
+		w := &Watcher{
+			configPath: path,
+			authDir:    authDir,
+			reloadCallback: func(cfg *config.Config) {
+				applied = append(applied, cfg.RequestRetry)
+				if cfg.RequestRetry == 1 {
+					next := cfg.CloneForRuntime()
+					next.RequestRetry = 3
+					if err := config.SaveConfigPreserveComments(path, next); err != nil {
+						t.Error(err)
+					}
+				}
+			},
+		}
+		w.SetConfigValidator(func(cfg *config.Config) error {
+			if cfg.RequestRetry == 1 {
+				return config.SaveConfigPreserveCommentsUpdateNestedScalar(path, []string{"host"}, "127.0.0.1")
+			}
+			return nil
+		})
+		w.ReloadConfigIfChanged()
+		w.ReloadConfigIfChanged()
+		if !reflect.DeepEqual(applied, []int{1, 3}) {
+			t.Fatalf("applied request-retry values = %v, want [1 3]", applied)
+		}
+	})
 }
