@@ -238,6 +238,16 @@ func (s *targetedTestMetaOAuthService) CreateTokenStorage(bundle *metaauth.MetaA
 	}
 }
 
+type trackedXAIOAuthService struct {
+	xaiOAuthService
+	pollingDone chan struct{}
+}
+
+func (s *trackedXAIOAuthService) WaitForAuthorization(ctx context.Context, deviceCode *xaiauth.DeviceCodeResponse) (*xaiauth.AuthBundle, error) {
+	defer close(s.pollingDone)
+	return s.xaiOAuthService.WaitForAuthorization(ctx, deviceCode)
+}
+
 func TestStartOAuthV8TargetedSessionRegistrationAcrossBuiltinProviders(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -256,6 +266,24 @@ func TestStartOAuthV8TargetedSessionRegistrationAcrossBuiltinProviders(t *testin
 		return rec.Result(), nil
 	})
 	t.Cleanup(func() { http.DefaultTransport = origTransport })
+
+	origXAIFactory := newXAIOAuthService
+	newXAIOAuthService = func(cfg *config.Config, proxyURL string) xaiOAuthService {
+		service := &trackedXAIOAuthService{
+			xaiOAuthService: origXAIFactory(cfg, proxyURL),
+			pollingDone:     make(chan struct{}),
+		}
+		t.Cleanup(func() {
+			// Session cancellation is asynchronous; join polling before restoring the transport.
+			select {
+			case <-service.pollingDone:
+			case <-time.After(5 * time.Second):
+				t.Error("xAI authorization polling did not stop after session cancellation")
+			}
+		})
+		return service
+	}
+	t.Cleanup(func() { newXAIOAuthService = origXAIFactory })
 
 	origCodexFactory := newCodexOAuthService
 	newCodexOAuthService = func(*config.Config) codexOAuthService {
