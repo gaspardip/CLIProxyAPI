@@ -99,13 +99,15 @@ func (h *Handler) GetLatestVersion(c *gin.Context) {
 }
 
 func WriteConfig(path string, data []byte) error {
-	_, err := writeConfig(path, data)
-	return err
+	prepared, err := prepareConfigWrite(data)
+	if err != nil {
+		return err
+	}
+	return writePreparedConfig(path, prepared)
 }
 
-// writeConfig returns the exact saved bytes without re-reading a file another
-// writer could have changed. Keep the inode for mounted configuration files.
-func writeConfig(path string, data []byte) ([]byte, error) {
+// prepareConfigWrite finalizes bytes before application validation and persistence.
+func prepareConfigWrite(data []byte) ([]byte, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, err
@@ -117,23 +119,27 @@ func writeConfig(path string, data []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	data = config.NormalizeCommentIndentation(data)
+	return config.NormalizeCommentIndentation(data), nil
+}
+
+// Keep the inode for mounted configuration files; write the validated bytes unchanged.
+func writePreparedConfig(path string, data []byte) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if _, errWrite := f.Write(data); errWrite != nil {
 		_ = f.Close()
-		return nil, errWrite
+		return errWrite
 	}
 	if errSync := f.Sync(); errSync != nil {
 		_ = f.Close()
-		return nil, errSync
+		return errSync
 	}
 	if errClose := f.Close(); errClose != nil {
-		return nil, errClose
+		return errClose
 	}
-	return data, nil
+	return nil
 }
 
 func (h *Handler) PutConfigYAML(c *gin.Context) {
@@ -147,7 +153,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
 		return
 	}
-	// Validate config using LoadConfigOptional with optional=false to enforce parsing
+	// Validate a staged file and require all loader rewrites to succeed.
 	tmpDir := filepath.Dir(h.configFilePath)
 	tmpFile, err := os.CreateTemp(tmpDir, "config-validate-*.yaml")
 	if err != nil {
@@ -168,7 +174,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": errWrite.Error()})
 		return
 	}
-	validated, err := config.LoadConfigOptional(tempFile, false)
+	validated, err := config.LoadConfigForSave(tempFile)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
@@ -180,17 +186,21 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": err.Error()})
 		return
 	}
+	prepared, err = prepareConfigWrite(prepared)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": err.Error()})
+		return
+	}
+	validated.SourceHash = config.ComputeSourceHash(prepared)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if !h.validateConfigLocked(c, validated) {
 		return
 	}
-	saved, err := writeConfig(h.configFilePath, prepared)
-	if err != nil {
+	if err = writePreparedConfig(h.configFilePath, prepared); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": "failed to write config"})
 		return
 	}
-	validated.SourceHash = config.ComputeSourceHash(saved)
 	h.cfg = validated
 	if h.configValidator != nil {
 		h.acceptedConfig = validated.CloneForRuntime()

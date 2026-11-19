@@ -61,7 +61,6 @@ func TestFullDocumentSavePublishesValidatedSnapshot(t *testing.T) {
 				t.Fatal("validator did not see the prepared management key")
 			}
 			published := h.cfg.CloneForRuntime()
-			published.SourceHash = validated.SourceHash
 			if !reflect.DeepEqual(published, validated) {
 				t.Fatal("handler published a different config from the validated snapshot")
 			}
@@ -129,6 +128,7 @@ func newFullDocumentHandler(t *testing.T) (*Handler, string, *gin.Engine) {
 	for _, method := range []string{http.MethodPut, http.MethodPatch} {
 		router.Handle(method, "/v8/management/config", h.ConfigV8)
 		router.Handle(method, "/v8/management/config.yaml", h.ConfigV8)
+		router.Handle(method, "/v8/management/config/*path", h.ConfigV8)
 	}
 	return h, path, router
 }
@@ -147,6 +147,8 @@ func TestFullDocumentSaveRejectsAmbiguousOAuthChannels(t *testing.T) {
 			{"v8 YAML", http.MethodPut, "/v8/management/config.yaml", "config-version: 8\noauth:\n  %s: %s\n"},
 			{"v8 JSON", http.MethodPut, "/v8/management/config", `{"oauth":{"%s":%s}}`},
 			{"v8 PATCH", http.MethodPatch, "/v8/management/config", `{"oauth":{"%s":%s}}`},
+			{"v8 map PUT", http.MethodPut, "/v8/management/config/oauth/" + field.name, `%[2]s`},
+			{"v8 map PATCH", http.MethodPatch, "/v8/management/config/oauth/" + field.name, `%[2]s`},
 		} {
 			t.Run(field.name+"/"+endpoint.name, func(t *testing.T) {
 				h, path, router := newFullDocumentHandler(t)
