@@ -1685,6 +1685,10 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 		return nil, fmt.Errorf("prepare meta auth: credential no longer registered")
 	}
 
+	if !sameDispatchProvider(auth, target) {
+		return auth, errors.New("credential provider changed before preparation")
+	}
+
 	if !preparer.ShouldPrepareRequestAuth(target) {
 		return target, nil
 	}
@@ -1698,11 +1702,17 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 		return target, nil
 	}
 
+	if !sameDispatchProvider(auth, updated) {
+		return auth, errors.New("credential provider changed during preparation")
+	}
 	saved, errUpdate := m.UpdatePreparedAuth(ctx, base, updated)
 	if errUpdate != nil {
 		return nil, errUpdate
 	}
 	if saved != nil {
+		if !sameDispatchProvider(auth, saved) {
+			return auth, errors.New("credential provider changed after preparation")
+		}
 		return saved, nil
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {

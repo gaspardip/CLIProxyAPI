@@ -31,3 +31,10 @@ func (m *Manager) validateDispatchAuth(ctx context.Context, model string, opts c
 	}
 	return &Error{Code: "dispatch_policy_denied", Message: "prepared credential is no longer authorized"}
 }
+
+// A prepared credential cannot reuse an executor/model resolved for another provider.
+func sameDispatchProvider(selected, current *Auth) bool {
+	return selected != nil && current != nil && selected.ID == current.ID && selected.Provider == current.Provider && executorKeyFromAuth(selected) == executorKeyFromAuth(current)
+}
+
+type dispatchProviderContextKey struct{}

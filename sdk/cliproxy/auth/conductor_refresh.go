@@ -1146,8 +1146,9 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
 		return auth, false
 	}
 	log.Debugf("unauthorized response for %s (%s), refreshing credentials before fallback", auth.Provider, auth.ID)
-	refreshed, errRefresh := m.refreshAuthForRequest(ctx, auth.ID, failedToken)
-	if errRefresh != nil || refreshed == nil {
+	ctx = context.WithValue(ctx, dispatchProviderContextKey{}, auth.Clone())
+	refreshed, errRefresh := m.refreshAuthForRequestAtEpoch(ctx, auth.ID, failedToken, auth.RegistrationEpoch)
+	if errRefresh != nil || !sameDispatchProvider(auth, refreshed) {
 		log.Debugf("credential refresh before fallback failed for %s (%s): %v", auth.Provider, auth.ID, errRefresh)
 		return auth, false
 	}
@@ -1270,6 +1271,9 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if auth == nil || exec == nil {
 		return nil, errors.New("auth or executor not found")
 	}
+	if selected, ok := ctx.Value(dispatchProviderContextKey{}).(*Auth); ok && !sameDispatchProvider(selected, auth) {
+		return nil, errors.New("credential provider changed before refresh")
+	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		if resolver, okResolver := store.(interface {
 			RefreshJournalFor(*Auth) (codex.RefreshJournal, error)
@@ -1386,6 +1390,9 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 
 	base := auth.Clone()
 	updated, err := exec.Refresh(ctx, base.Clone())
+	if updated != nil && !sameDispatchProvider(base, updated) {
+		return nil, errors.New("credential provider changed during refresh")
+	}
 	now := time.Now()
 	refreshCanceled := (errors.Is(err, context.Canceled) || errors.Is(err, codex.ErrSIWCRefreshDeferred)) && !codex.IsRefreshOutcomeUnknown(err)
 	if refreshCanceled {

@@ -34,15 +34,29 @@ func (p *dispatchPolicy) Pick(ctx context.Context, provider, model string, opts 
 }
 
 type dispatchPolicyExecutor struct {
-	boundary string
-	replace  bool
-	calls    []*Auth
+	boundary         string
+	changeProvider   bool
+	onBoundary       func()
+	prepareProviders []string
+	refreshProviders []string
+	replace          bool
+	calls            []*Auth
 }
 
-func (*dispatchPolicyExecutor) Identifier() string                    { return "antigravity" }
-func (e *dispatchPolicyExecutor) ShouldPrepareRequestAuth(*Auth) bool { return e.boundary == "prepare" }
+func (*dispatchPolicyExecutor) Identifier() string { return "antigravity" }
+func (e *dispatchPolicyExecutor) ShouldPrepareRequestAuth(*Auth) bool {
+	if e.boundary == "prepare" && e.onBoundary != nil {
+		f := e.onBoundary
+		e.onBoundary = nil
+		f()
+	}
+	return e.boundary == "prepare"
+}
 func (e *dispatchPolicyExecutor) change(a *Auth) *Auth {
 	a = a.Clone()
+	if e.changeProvider {
+		a.Provider = "different-provider"
+	}
 	a.Metadata["access_token"] = "fixture-refreshed"
 	if e.replace {
 		a.Metadata["email"] = "replacement@example.com"
@@ -50,13 +64,20 @@ func (e *dispatchPolicyExecutor) change(a *Auth) *Auth {
 	return a
 }
 func (e *dispatchPolicyExecutor) PrepareRequestAuth(_ context.Context, a *Auth) (*Auth, error) {
+	e.prepareProviders = append(e.prepareProviders, a.Provider)
 	return e.change(a), nil
 }
 func (e *dispatchPolicyExecutor) Refresh(_ context.Context, a *Auth) (*Auth, error) {
+	e.refreshProviders = append(e.refreshProviders, a.Provider)
 	return e.change(a), nil
 }
 func (e *dispatchPolicyExecutor) Execute(_ context.Context, a *Auth, _ exec.Request, _ exec.Options) (exec.Response, error) {
 	e.calls = append(e.calls, a.Clone())
+	if e.boundary != "prepare" && e.onBoundary != nil {
+		f := e.onBoundary
+		e.onBoundary = nil
+		f()
+	}
 	if e.boundary != "prepare" && len(e.calls) == 1 {
 		return exec.Response{}, &Error{HTTPStatus: 401, Message: "fixture unauthorized"}
 	}
@@ -148,6 +169,113 @@ func TestDispatchPolicyRevalidatesPreparedAndRefreshedAuth(t *testing.T) {
 					})
 				}
 			}
+		}
+	}
+}
+
+func TestDispatchProviderCannotChangeDuringPreparationOrRefresh(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, boundary := range []string{"prepare", "401", "bootstrap"} {
+			if boundary == "bootstrap" && !stream {
+				continue
+			}
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, boundary), func(t *testing.T) {
+				ctx := context.Background()
+				m := NewManager(nil, &dispatchPolicy{}, nil)
+				e := &dispatchPolicyExecutor{boundary: boundary, changeProvider: true}
+				m.RegisterExecutor(e)
+				a := &Auth{ID: t.Name(), Provider: "antigravity", Metadata: map[string]any{"email": "authorized@example.com", "access_token": "fixture-original", "refresh_token": "fixture-refresh"}}
+				if _, err := m.Register(ctx, a); err != nil {
+					t.Fatal(err)
+				}
+				registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: "provider-specific-model"}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
+				m.RefreshSchedulerEntry(a.ID)
+				req := exec.Request{Model: "provider-specific-model"}
+				var err error
+				if stream {
+					var result *exec.StreamResult
+					result, err = m.ExecuteStream(ctx, []string{a.Provider}, req, exec.Options{})
+					if err == nil {
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								err = chunk.Err
+							}
+						}
+					}
+				} else {
+					_, err = m.Execute(ctx, []string{a.Provider}, req, exec.Options{})
+				}
+				if err == nil {
+					t.Error("provider-changing dispatch succeeded")
+				}
+				for _, actual := range e.calls {
+					if actual.Provider != e.Identifier() {
+						t.Error("credential provider differs from executing adapter")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestDispatchProviderReplacementBeforePreparationAndRefresh(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, boundary := range []string{"prepare", "401", "bootstrap"} {
+			if boundary == "bootstrap" && !stream {
+				continue
+			}
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, boundary), func(t *testing.T) {
+				ctx := context.Background()
+				m := NewManager(nil, &dispatchPolicy{}, nil)
+				e := &dispatchPolicyExecutor{boundary: boundary}
+				m.RegisterExecutor(e)
+				other := &unauthorizedRefreshExecutor{id: "different-provider", refreshTokens: map[string]string{t.Name(): "fixture-other"}}
+				m.RegisterExecutor(other)
+				a := &Auth{ID: t.Name(), Provider: "antigravity", Metadata: map[string]any{"email": "authorized@example.com", "access_token": "fixture-original", "refresh_token": "fixture-refresh"}}
+				if _, err := m.Register(ctx, a); err != nil {
+					t.Fatal(err)
+				}
+				registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: "provider-specific-model"}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
+				m.RefreshSchedulerEntry(a.ID)
+				e.onBoundary = func() {
+					replacement, ok := m.GetByID(a.ID)
+					if !ok {
+						t.Fatal("missing fixture")
+					}
+					replacement.Provider = "different-provider"
+					if _, err := m.Update(ctx, replacement); err != nil {
+						t.Fatal(err)
+					}
+				}
+				req := exec.Request{Model: "provider-specific-model"}
+				var err error
+				if stream {
+					var result *exec.StreamResult
+					result, err = m.ExecuteStream(ctx, []string{a.Provider}, req, exec.Options{})
+					if err == nil {
+						for chunk := range result.Chunks {
+							if chunk.Err != nil {
+								err = chunk.Err
+							}
+						}
+					}
+				} else {
+					_, err = m.Execute(ctx, []string{a.Provider}, req, exec.Options{})
+				}
+				if err == nil {
+					t.Error("provider replacement was dispatched")
+				}
+				if len(e.prepareProviders) != 0 || len(e.refreshProviders) != 0 || other.RefreshCalls() != 0 {
+					t.Error("provider-specific preparation or refresh ran after replacement")
+				}
+				for _, actual := range e.calls {
+					if actual.Provider != e.Identifier() {
+						t.Error("old executor received another provider credential")
+					}
+				}
+			})
 		}
 	}
 }
