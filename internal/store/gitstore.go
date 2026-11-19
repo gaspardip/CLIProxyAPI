@@ -1303,8 +1303,8 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 			baselineRepo = inspectedRepo
 			baselineTree = inspectedTree
 		}
-		// Saves can change any tracked target through a config link while cloning.
-		localChanges, errLocal := recoveryWorktreeChanges(baselineRepo, baselineTree, remoteTree, dirtyPaths)
+		// Saves can change an ignored config or linked target while cloning.
+		localChanges, errLocal := recoveryWorktreeChanges(repoDir, baselineRepo, baselineTree, remoteTree, dirtyPaths)
 		if errLocal != nil {
 			return fmt.Errorf("inspect recovery worktree: %w", errLocal)
 		}
@@ -1381,7 +1381,7 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 
 // Use the same index/filesystem comparison as go-git Status, with tree entries
 // instead of the possibly half-updated index. No baseline blobs are read.
-func recoveryWorktreeChanges(repo *git.Repository, baselineTree, remoteTree *object.Tree, prePullDirty map[string]struct{}) (map[string]struct{}, error) {
+func recoveryWorktreeChanges(repoDir string, repo *git.Repository, baselineTree, remoteTree *object.Tree, prePullDirty map[string]struct{}) (map[string]struct{}, error) {
 	worktree, err := repo.Worktree()
 	if err != nil {
 		return nil, err
@@ -1411,6 +1411,12 @@ func recoveryWorktreeChanges(repo *git.Repository, baselineTree, remoteTree *obj
 		indexes[i] = idx
 		tracked.Entries = append(tracked.Entries, idx.Entries...)
 	}
+	configEntries, err := recoveryConfigEntries(repoDir)
+	if err != nil {
+		return nil, fmt.Errorf("inspect active config: %w", err)
+	}
+	// Visibility only: these entries never enter either comparison tree or Git's index.
+	tracked.Entries = append(tracked.Entries, configEntries...)
 	patterns, err := gitignore.ReadPatterns(worktree.Filesystem(), nil)
 	if err != nil {
 		return nil, err
@@ -1452,6 +1458,70 @@ func recoveryWorktreeChanges(repo *git.Repository, baselineTree, remoteTree *obj
 		}
 	}
 	return localChanges, nil
+}
+
+func recoveryConfigEntries(repoDir string) ([]*gitindex.Entry, error) {
+	root, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		return nil, err
+	}
+	dir := root
+	pending := []string{"config", "config.yaml"}
+	var entries []*gitindex.Entry
+	links := 0
+	for len(pending) > 0 {
+		part := pending[0]
+		pending = pending[1:]
+		path := filepath.Join(dir, part)
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil, err
+		}
+		// Preserve external links themselves, never copy their targets or Git metadata.
+		if !filepath.IsLocal(rel) || part == ".git" {
+			return entries, nil
+		}
+		info, err := os.Lstat(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return entries, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			entries = append(entries, &gitindex.Entry{Name: filepath.ToSlash(rel)})
+			links++
+			if links > 255 {
+				return nil, fmt.Errorf("too many config symlinks")
+			}
+			target, err := os.Readlink(path)
+			if err != nil {
+				return nil, err
+			}
+			if filepath.IsAbs(target) {
+				var inside bool
+				if target == root {
+					target, inside = ".", true
+				} else {
+					target, inside = strings.CutPrefix(target, root+string(filepath.Separator))
+				}
+				if !inside {
+					return entries, nil
+				}
+				dir = root
+			}
+			pending = append(strings.Split(target, string(filepath.Separator)), pending...)
+			continue
+		}
+		if len(pending) == 0 {
+			if !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("config has unsupported file mode %s", info.Mode())
+			}
+			entries = append(entries, &gitindex.Entry{Name: filepath.ToSlash(rel)})
+		}
+		dir = path
+	}
+	return entries, nil
 }
 
 func inspectRecoveryBaseline(repoDir string) (repoResult *git.Repository, treeResult *object.Tree, dirtyResult map[string]struct{}, errResult error) {

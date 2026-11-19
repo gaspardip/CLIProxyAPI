@@ -49,6 +49,149 @@ func commitRecoveryFixture(t *testing.T, dir string) {
 	}
 }
 
+func TestEnsureRepositoryPreservesIgnoredActiveConfig(t *testing.T) {
+	for _, layout := range []struct {
+		name   string
+		ignore string
+		target string
+		links  [][2]string
+	}{
+		{name: "file", ignore: "config/*.yaml\n", target: "config/config.yaml"},
+		{name: "ancestor", ignore: "config/\n", target: "config/config.yaml"},
+		{name: "file link", ignore: "config/\nprivate/\n", target: "private/settings.yaml", links: [][2]string{{"config/config.yaml", "../private/settings.yaml"}}},
+		{name: "directory link", ignore: "config\nprivate/\n", target: "private/config.yaml", links: [][2]string{{"config", "private"}}},
+		{name: "link chain", ignore: "config\nprivate/\n", target: "private/settings/active.yaml", links: [][2]string{{"config", "private/alias"}, {"private/alias", "settings"}, {"private/settings/config.yaml", "active.yaml"}}},
+		{name: "absolute link", ignore: "config\nprivate/\n", target: "private/config.yaml", links: [][2]string{{"config", "$repo/private"}}},
+		{name: "absolute root link", ignore: "config\n*.yaml\n", target: "config.yaml", links: [][2]string{{"config", "$repo"}}},
+		{name: "external link", ignore: "config/\n", target: "../external.yaml", links: [][2]string{{"config/config.yaml", "../../external.yaml"}}},
+	} {
+		t.Run(layout.name, func(t *testing.T) {
+			root := t.TempDir()
+			remote := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "seed\n"})
+			store := NewGitTokenStore(remote, "", "", "master")
+			repoDir := filepath.Join(root, "workspace")
+			store.SetBaseDir(filepath.Join(repoDir, "auths"))
+			if err := store.EnsureRepository(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte(layout.ignore+"unrelated/\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			commitRecoveryFixture(t, repoDir)
+			if err := os.Remove(filepath.Join(repoDir, "config")); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(repoDir, layout.target)
+			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := api.WriteConfig(target, []byte("port: 8317\n")); err != nil {
+				t.Fatal(err)
+			}
+			for _, link := range layout.links {
+				path := filepath.Join(repoDir, link[0])
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(strings.ReplaceAll(link[1], "$repo", repoDir), path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			const latest = "# successful local save\r\nport: 8321\r\n"
+			if err := api.WriteConfig(store.ConfigPath(), []byte(latest)); err != nil {
+				t.Fatal(err)
+			}
+			ignored := []string{"unrelated/notes.yaml", filepath.Join(filepath.Dir(layout.target), "other.yaml")}
+			for _, path := range ignored {
+				if err := os.MkdirAll(filepath.Dir(filepath.Join(repoDir, path)), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := api.WriteConfig(filepath.Join(repoDir, path), []byte("port: 9000\n")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			removeHeadFileObject(t, repoDir, "corrupt-object.txt")
+			if err := store.EnsureRepository(); err != nil {
+				t.Fatal(err)
+			}
+			assertLocalFileContents(t, store.ConfigPath(), latest)
+			assertLocalFileContents(t, target, latest)
+			for _, link := range layout.links {
+				want := strings.ReplaceAll(link[1], "$repo", repoDir)
+				if got, err := os.Readlink(filepath.Join(repoDir, link[0])); err != nil || got != want {
+					t.Fatalf("link %s = %q, %v; want %q", link[0], got, err, want)
+				}
+			}
+			for _, path := range ignored {
+				if strings.HasPrefix(path, "..") {
+					assertLocalFileContents(t, filepath.Join(repoDir, path), "port: 9000\n")
+					continue
+				}
+				if _, err := os.Lstat(filepath.Join(repoDir, path)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("unrelated ignored path %s survived recovery: %v", path, err)
+				}
+			}
+			repo, err := git.PlainOpen(repoDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := repo.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			index, err := repo.Storer.Index()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range index.Entries {
+				if entry.Name != ".gitignore" && entry.Name != "branch.txt" {
+					t.Errorf("recovery staged local path %s", entry.Name)
+				}
+			}
+			assertRemoteTreePath(t, remote, "master", "config/config.yaml", false)
+			if !strings.HasPrefix(layout.target, "..") {
+				assertRemoteTreePath(t, remote, "master", layout.target, false)
+			}
+		})
+	}
+}
+
+func TestEnsureRepositoryIgnoredConfigLinkWithoutTarget(t *testing.T) {
+	for _, target := range []string{"missing.yaml", "config.yaml"} {
+		t.Run(target, func(t *testing.T) {
+			root := t.TempDir()
+			remote := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "seed\n"})
+			store := NewGitTokenStore(remote, "", "", "master")
+			repoDir := filepath.Join(root, "workspace")
+			store.SetBaseDir(filepath.Join(repoDir, "auths"))
+			if err := store.EnsureRepository(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("config/\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			commitRecoveryFixture(t, repoDir)
+			if err := os.Symlink(target, store.ConfigPath()); err != nil {
+				t.Fatal(err)
+			}
+			removeHeadFileObject(t, repoDir, "corrupt-object.txt")
+			err := store.EnsureRepository()
+			if target == "config.yaml" {
+				if err == nil || !strings.Contains(err.Error(), "too many config symlinks") {
+					t.Fatalf("cyclic config link recovery error = %v", err)
+				}
+				assertLocalFileContents(t, filepath.Join(repoDir, "corrupt-object.txt"), "corrupt me\n")
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := os.Readlink(store.ConfigPath()); err != nil || got != target {
+				t.Fatalf("config link = %q, %v; want %q", got, err, target)
+			}
+		})
+	}
+}
+
 func TestGitRecoveryPreservesLinkedConfigDirectory(t *testing.T) {
 	for _, absolute := range []bool{false, true} {
 		name := "relative"
@@ -119,13 +262,15 @@ func (f recoveryTransport) Handshake(ctx context.Context, req *transport.Request
 }
 
 func TestGitRecoveryPreservesConfigSavedDuringClone(t *testing.T) {
-	for _, layout := range []string{"regular", "file link", "directory link"} {
+	for _, fixture := range []string{"regular", "file link", "directory link", "ignored regular", "ignored file link", "ignored directory link"} {
+		ignored := strings.HasPrefix(fixture, "ignored ")
+		layout := strings.TrimPrefix(fixture, "ignored ")
 		for _, suppliedBaseline := range []bool{false, true} {
 			name := "inspect baseline"
 			if suppliedBaseline {
 				name = "pre-pull baseline"
 			}
-			t.Run(layout+"/"+name, func(t *testing.T) {
+			t.Run(fixture+"/"+name, func(t *testing.T) {
 				root := t.TempDir()
 				remote := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "seed\n"})
 				store := NewGitTokenStore(remote, "", "", "master")
@@ -157,6 +302,11 @@ func TestGitRecoveryPreservesConfigSavedDuringClone(t *testing.T) {
 						t.Fatal(err)
 					}
 					if err := os.Symlink("settings", filepath.Join(repoDir, "config")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if ignored {
+					if err := os.WriteFile(filepath.Join(repoDir, ".gitignore"), []byte("config\nsettings*\n"), 0o600); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -214,6 +364,10 @@ func TestGitRecoveryPreservesConfigSavedDuringClone(t *testing.T) {
 					targetInfo, err := os.Stat(targetPath)
 					if err != nil || !os.SameFile(aliasInfo, targetInfo) {
 						t.Fatalf("saved config no longer names its tracked target: %v", err)
+					}
+					if ignored {
+						assertRemoteTreePath(t, remote, "master", remotePath, false)
+						return
 					}
 					if layout == "regular" {
 						if err := store.PersistConfig(context.Background()); err != nil {
