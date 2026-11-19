@@ -338,7 +338,7 @@ func (s *ObjectTokenStore) PersistConfig(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := os.ReadFile(s.configPath)
+	data, err := config.ReadConfigFile(s.configPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return s.deleteObject(ctx, objectStoreConfigKey)
@@ -400,12 +400,9 @@ func (s *ObjectTokenStore) syncConfigFromBucket(ctx context.Context, example str
 		// Seed the bucket with the file the startup load leaves behind, so a plaintext
 		// management secret never reaches it. Fail instead of skipping: the startup load
 		// could turn a refused file into one that a later start would upload.
-		if errPrepare := config.PrepareConfigFileForUpload(s.configPath); errPrepare != nil {
-			return fmt.Errorf("object store: prepare local config for seeding: %w", errPrepare)
-		}
-		data, errRead := os.ReadFile(s.configPath)
+		data, errRead := config.ReadConfigFileForUpload(s.configPath)
 		if errRead != nil {
-			return fmt.Errorf("object store: read local config: %w", errRead)
+			return fmt.Errorf("object store: prepare local config for seeding: %w", errRead)
 		}
 		if len(data) > 0 {
 			if errPut := s.putObject(ctx, objectStoreConfigKey, data, "application/x-yaml"); errPut != nil {

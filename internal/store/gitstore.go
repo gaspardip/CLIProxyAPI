@@ -22,6 +22,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -1742,33 +1743,33 @@ func (s *GitTokenStore) commitAndPushWithOptionsLocked(ctx context.Context, mess
 		}
 	}
 
+	// The index is the committed file snapshot. Capture it while saves and
+	// restoration are fenced; Commit reads this index, never the live file.
 	added := false
-	for _, rel := range managedPaths {
-		if _, err = worktree.Add(rel); err != nil {
-			if errors.Is(err, gitindex.ErrEntryNotFound) {
-				continue
-			}
-			if errors.Is(err, os.ErrNotExist) {
-				if _, errRemove := worktree.Remove(rel); errRemove != nil {
-					if errors.Is(errRemove, os.ErrNotExist) || errors.Is(errRemove, gitindex.ErrEntryNotFound) {
-						continue
-					}
-					return fmt.Errorf("git token store: remove %s: %w", rel, errRemove)
+	if err = internalconfig.WithFileAccess(func() error {
+		for _, rel := range managedPaths {
+			if _, errAdd := worktree.Add(rel); errAdd != nil {
+				if errors.Is(errAdd, gitindex.ErrEntryNotFound) {
+					continue
 				}
-			} else {
-				return fmt.Errorf("git token store: add %s: %w", rel, err)
+				if errors.Is(errAdd, os.ErrNotExist) {
+					if _, errRemove := worktree.Remove(rel); errRemove != nil {
+						if errors.Is(errRemove, os.ErrNotExist) || errors.Is(errRemove, gitindex.ErrEntryNotFound) {
+							continue
+						}
+						return fmt.Errorf("git token store: remove %s: %w", rel, errRemove)
+					}
+				} else {
+					return fmt.Errorf("git token store: add %s: %w", rel, errAdd)
+				}
 			}
+			added = true
 		}
-		added = true
+		return nil
+	}); err != nil {
+		return err
 	}
 	if !added {
-		return nil
-	}
-	status, err := worktree.Status()
-	if err != nil {
-		return fmt.Errorf("git token store: status: %w", err)
-	}
-	if status.IsClean() {
 		return nil
 	}
 	if strings.TrimSpace(message) == "" {

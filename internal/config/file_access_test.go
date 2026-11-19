@@ -18,6 +18,13 @@ func TestConfigFileHelpersWaitForWrite(t *testing.T) {
 			return SaveConfigPreserveCommentsUpdateNestedScalar(path, []string{"host"}, "127.0.0.1")
 		},
 		"upload preparation": PrepareConfigFileForUpload,
+		"upload snapshot": func(path string) error {
+			data, err := ReadConfigFileForUpload(path)
+			if err == nil && string(data) != "# accepted config\nport: 8317\nrequest-retry: 3\n" {
+				t.Errorf("upload snapshot contains uncommitted bytes: %q", data)
+			}
+			return err
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {

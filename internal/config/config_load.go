@@ -41,25 +41,35 @@ func ComputeSourceHash(data []byte) string {
 // copies stay identical. When the plaintext cannot be removed it returns an error and
 // leaves configFile untouched, so every later attempt refuses the file again.
 func PrepareConfigFileForUpload(configFile string) error {
-	return WithFileAccess(func() error { return prepareConfigFileForUpload(configFile) })
+	_, err := ReadConfigFileForUpload(configFile)
+	return err
 }
 
-func prepareConfigFileForUpload(configFile string) error {
+// ReadConfigFileForUpload captures the prepared startup file in the same gate as
+// its rewrites, releasing the gate before stores send the returned bytes.
+func ReadConfigFileForUpload(configFile string) (data []byte, err error) {
+	err = WithFileAccess(func() error {
+		data, err = prepareConfigFileForUpload(configFile)
+		return err
+	})
+	return data, err
+}
+
+func prepareConfigFileForUpload(configFile string) ([]byte, error) {
 	data, errRead := os.ReadFile(configFile)
 	if errRead != nil {
-		return errRead
+		return nil, errRead
 	}
 	prepared, errPrepare := prepareConfigForUpload(data)
 	if errPrepare != nil {
-		return errPrepare
+		return nil, errPrepare
 	}
-	if bytes.Equal(prepared, data) {
-		return nil
+	if !bytes.Equal(prepared, data) {
+		if errWrite := os.WriteFile(configFile, prepared, 0600); errWrite != nil {
+			return nil, fmt.Errorf("failed to write prepared config file: %w", errWrite)
+		}
 	}
-	if errWrite := os.WriteFile(configFile, prepared, 0600); errWrite != nil {
-		return fmt.Errorf("failed to write prepared config file: %w", errWrite)
-	}
-	return nil
+	return prepared, nil
 }
 
 // prepareConfigForUpload returns data with the file rewrites of a startup load applied.

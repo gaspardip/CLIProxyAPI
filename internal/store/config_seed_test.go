@@ -186,8 +186,7 @@ func TestObjectTokenStoreSeedRefusesConfigThatKeepsPlaintextSecret(t *testing.T)
 	}
 }
 
-// seedTestDatabase is a database/sql driver whose config table is empty; it records
-// every config upsert.
+// seedTestDatabase starts with an empty config table and records every upsert.
 type seedTestDatabase struct {
 	mu      sync.Mutex
 	upserts []string
@@ -197,7 +196,7 @@ type seedTestConn struct {
 	database *seedTestDatabase
 }
 
-type seedTestRows struct{}
+type seedTestRows struct{ content []string }
 
 func (d *seedTestDatabase) Open(string) (driver.Conn, error) {
 	return &seedTestConn{database: d}, nil
@@ -235,9 +234,12 @@ func (c *seedTestConn) ExecContext(_ context.Context, query string, args []drive
 	return driver.RowsAffected(1), nil
 }
 
-// QueryContext serves an empty config table.
-func (*seedTestConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
-	return seedTestRows{}, nil
+func (c *seedTestConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	upserts := c.database.recordedUpserts()
+	if len(upserts) > 0 {
+		upserts = upserts[len(upserts)-1:]
+	}
+	return &seedTestRows{content: upserts}, nil
 }
 
 func (seedTestRows) Columns() []string {
@@ -248,8 +250,13 @@ func (seedTestRows) Close() error {
 	return nil
 }
 
-func (seedTestRows) Next([]driver.Value) error {
-	return io.EOF
+func (r *seedTestRows) Next(dest []driver.Value) error {
+	if len(r.content) == 0 {
+		return io.EOF
+	}
+	dest[0] = r.content[0]
+	r.content = nil
+	return nil
 }
 
 func newSeedTestPostgresStore(t *testing.T, configPath string) (*PostgresStore, *seedTestDatabase) {

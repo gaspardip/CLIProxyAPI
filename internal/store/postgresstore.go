@@ -442,7 +442,7 @@ func (s *PostgresStore) PersistConfig(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := os.ReadFile(s.configPath)
+	data, err := config.ReadConfigFile(s.configPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return s.deleteConfigRecord(ctx)
@@ -476,12 +476,9 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 		// Seed the database with the file the startup load leaves behind, so a plaintext
 		// management secret never reaches it. Fail instead of skipping: the startup load
 		// could turn a refused file into one that a later start would upload.
-		if errPrepare := config.PrepareConfigFileForUpload(s.configPath); errPrepare != nil {
-			return fmt.Errorf("postgres store: prepare local config for seeding: %w", errPrepare)
-		}
-		data, errRead := os.ReadFile(s.configPath)
+		data, errRead := config.ReadConfigFileForUpload(s.configPath)
 		if errRead != nil {
-			return fmt.Errorf("postgres store: read local config: %w", errRead)
+			return fmt.Errorf("postgres store: prepare local config for seeding: %w", errRead)
 		}
 		if errPersist := s.persistConfig(ctx, data); errPersist != nil {
 			return errPersist
