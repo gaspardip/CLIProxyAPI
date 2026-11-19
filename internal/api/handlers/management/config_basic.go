@@ -99,6 +99,9 @@ func (h *Handler) GetLatestVersion(c *gin.Context) {
 }
 
 func WriteConfig(path string, data []byte) error {
+	if _, err := config.ParseConfigBytes(data); err != nil {
+		return err
+	}
 	prepared, err := prepareConfigWrite(data)
 	if err != nil {
 		return err
@@ -151,6 +154,11 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 	var cfg config.Config
 	if err = yaml.Unmarshal(body, &cfg); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_yaml", "message": err.Error()})
+		return
+	}
+	// Validate submitted values before any formatting or layout changes.
+	if _, err = config.ParseConfigBytes(body); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "invalid_config", "message": err.Error()})
 		return
 	}
 	// Validate a staged file and require all loader rewrites to succeed.

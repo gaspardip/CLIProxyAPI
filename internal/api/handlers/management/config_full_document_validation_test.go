@@ -91,14 +91,16 @@ func TestFullDocumentSavePublishesValidatedSnapshot(t *testing.T) {
 			if !os.SameFile(before, after) {
 				t.Fatal("save replaced the mounted config inode")
 			}
-			if tc.legacy {
-				if disk.RemoteManagement.SecretKey != validated.RemoteManagement.SecretKey {
-					t.Fatal("legacy save did not persist the validated management-key hash")
+			if disk.RemoteManagement.SecretKey != validated.RemoteManagement.SecretKey {
+				t.Fatal("save did not persist the validated management-key hash")
+			}
+			if h.cfg.SourceHash != config.ComputeSourceHash(saved) {
+				t.Fatal("snapshot source hash does not identify the saved bytes")
+			}
+			if !tc.legacy {
+				if rec.Header().Get("ETag") != `"`+h.cfg.SourceHash+`"` {
+					t.Fatal("save ETag differs from the published snapshot")
 				}
-				if h.cfg.SourceHash != config.ComputeSourceHash(saved) {
-					t.Fatal("legacy snapshot source hash does not identify the saved bytes")
-				}
-			} else {
 				select {
 				case next := <-reloads:
 					if !reflect.DeepEqual(next, validated) {
@@ -226,5 +228,61 @@ func TestFullDocumentSaveFailureDoesNotPublish(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestFullDocumentSaveValidatesRawScalarContent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct{ name, url, body string }{
+		{"legacy", "/v0/management/config.yaml", "trusted-proxies:\n  - |-\n    127.0.0.1\n    # invalid proxy suffix\n"},
+		{"v0 v8", "/v0/management/config.yaml", "config-version: 8\nserver:\n  trusted-proxies:\n    - |-\n      127.0.0.1\n      # invalid proxy suffix\n"},
+		{"v8", "/v8/management/config.yaml", "config-version: 8\nserver:\n  trusted-proxies:\n    - |-\n      127.0.0.1\n      # invalid proxy suffix\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, path, router := newFullDocumentHandler(t)
+			before := h.cfg.CloneForRuntime()
+			original, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, tc.url, strings.NewReader(tc.body)))
+			if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), "invalid trusted-proxies entry") {
+				t.Errorf("raw scalar validation status=%d, want invalid_config rejection", rec.Code)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(original) || !reflect.DeepEqual(h.cfg, before) || h.reloadGeneration != 0 {
+				t.Fatal("rejected raw scalar changed disk, handler, or reload generation")
+			}
+		})
+	}
+}
+
+func TestFullDocumentSavePreservesScalarContent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct{ name, url, body string }{
+		{"legacy", "/v0/management/config.yaml", "host: |-\n  first\n  # scalar data\nport: 8320\n"},
+		{"v0 v8", "/v0/management/config.yaml", "config-version: 8\nserver:\n  host: |-\n    first\n    # scalar data\n  port: 8320\n"},
+		{"v8", "/v8/management/config.yaml", "config-version: 8\nserver:\n  host: |-\n    first\n    # scalar data\n  port: 8320\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, path, router := newFullDocumentHandler(t)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, tc.url, strings.NewReader(tc.body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("save status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			loaded, err := config.LoadConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const want = "first\n# scalar data"
+			if loaded.Host != want || h.cfg.Host != want || loaded.Port != 8320 || h.cfg.Port != 8320 {
+				t.Fatal("save changed scalar contents on disk or in the published config")
+			}
+		})
 	}
 }
