@@ -169,7 +169,7 @@ func TestEnsureRepositoryPreservesIgnoredActiveConfig(t *testing.T) {
 }
 
 func TestPersistConfigRespectsIgnorePolicy(t *testing.T) {
-	for _, recovery := range []bool{false, true} {
+	for _, recovery := range []string{"none", "persist", "ensure"} {
 		for _, policy := range []struct {
 			name, ignore, nested, exclude string
 			tracked, persist              bool
@@ -185,11 +185,9 @@ func TestPersistConfigRespectsIgnorePolicy(t *testing.T) {
 			{name: "local exclude", exclude: "config/config.yaml\n"},
 			{name: "local exclude overridden", exclude: "config/config.yaml\n", ignore: "!config/config.yaml\n", persist: true},
 			{name: "tracked ignored", ignore: "config/\n", tracked: true, persist: true},
+			{name: "tracked locally excluded", exclude: "config/config.yaml\n", tracked: true, persist: true},
 		} {
-			name := policy.name
-			if recovery {
-				name += " with recovery"
-			}
+			name := policy.name + "/" + recovery
 			t.Run(name, func(t *testing.T) {
 				root := t.TempDir()
 				remote := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "seed\n"})
@@ -217,49 +215,261 @@ func TestPersistConfigRespectsIgnorePolicy(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(repoDir, ".git", "info", "exclude"), []byte(policy.exclude), 0o600); err != nil {
 					t.Fatal(err)
 				}
+				marker := filepath.Join(repoDir, ".git", "unrelated-metadata")
+				if err := os.WriteFile(marker, []byte("do not preserve\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
 				const contents = "# accepted local config\r\nport: 8321\r\n"
 				if err := api.WriteConfig(store.ConfigPath(), []byte(contents)); err != nil {
 					t.Fatal(err)
 				}
-				if recovery {
+				if recovery != "none" {
 					removeHeadFileObject(t, repoDir, "corrupt-object.txt")
+				}
+				if recovery == "ensure" {
+					if err := store.EnsureRepository(); err != nil {
+						t.Fatal(err)
+					}
 				}
 				// This is the real watcher persister, including recovery, staging and push.
 				if err := store.PersistConfig(context.Background()); err != nil {
 					t.Fatal(err)
 				}
 				assertLocalFileContents(t, store.ConfigPath(), contents)
-				repo, err := git.PlainOpen(repoDir)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer func() {
-					if err := repo.Close(); err != nil {
-						t.Error(err)
-					}
-				}()
-				if err := verifyRepositoryHead(repo); err != nil {
-					t.Fatalf("persistence left repository corrupt: %v", err)
-				}
-				if recovery && policy.exclude != "" {
-					if _, err := os.Lstat(filepath.Join(repoDir, ".git", "info", "exclude")); !errors.Is(err, os.ErrNotExist) {
-						t.Fatalf("recovery copied local Git metadata: %v", err)
+				assertConfigPublication(t, repoDir, remote, policy.persist, contents)
+				if recovery != "none" {
+					if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("recovery copied unrelated Git metadata: %v", err)
 					}
 				}
-				index, err := repo.Storer.Index()
-				if err != nil {
-					t.Fatal(err)
+				for _, reopen := range []bool{false, true} {
+					if reopen {
+						store = NewGitTokenStore(remote, "", "", "master")
+						store.SetBaseDir(filepath.Join(repoDir, "auths"))
+					}
+					updated := contents + "# next watcher save\n"
+					if reopen {
+						updated += "# reopened store\n"
+					}
+					if err := api.WriteConfig(store.ConfigPath(), []byte(updated)); err != nil {
+						t.Fatal(err)
+					}
+					if err := store.PersistConfig(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+					assertLocalFileContents(t, store.ConfigPath(), updated)
+					assertConfigPublication(t, repoDir, remote, policy.persist, updated)
 				}
-				_, err = index.Entry("config/config.yaml")
-				if policy.persist && err != nil || !policy.persist && !errors.Is(err, gitindex.ErrEntryNotFound) {
-					t.Errorf("config index visibility = %v, want tracked %v", err, policy.persist)
-				}
-				assertRemoteTreePath(t, remote, "master", "config/config.yaml", policy.persist)
-				if policy.persist {
-					assertRemoteFileContents(t, remote, "master", "config/config.yaml", contents)
-				}
+				assertLocalFileContents(t, filepath.Join(repoDir, ".git", "info", "exclude"), policy.exclude)
 			})
 		}
+	}
+}
+
+func assertConfigPublication(t *testing.T, repoDir, remote string, tracked bool, contents string) {
+	t.Helper()
+	repo, err := git.PlainOpen(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := repo.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if err := verifyRepositoryHead(repo); err != nil {
+		t.Fatalf("persistence left repository corrupt: %v", err)
+	}
+	index, err := repo.Storer.Index()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = index.Entry("config/config.yaml")
+	if tracked && err != nil || !tracked && !errors.Is(err, gitindex.ErrEntryNotFound) {
+		t.Errorf("config index visibility = %v, want tracked %v", err, tracked)
+	}
+	for _, entry := range index.Entries {
+		if strings.HasPrefix(entry.Name, ".git/") {
+			t.Errorf("staged local metadata: %s", entry.Name)
+		}
+	}
+	assertRemoteTreePath(t, remote, "master", "config/config.yaml", tracked)
+	assertRemoteTreePath(t, remote, "master", ".git/info/exclude", false)
+	if tracked {
+		assertRemoteFileContents(t, remote, "master", "config/config.yaml", contents)
+	}
+}
+
+func TestPersistConfigHonorsLocalExcludeEditsAfterRecovery(t *testing.T) {
+	for _, edit := range []string{"remove", "empty", "negate"} {
+		t.Run(edit, func(t *testing.T) {
+			root := t.TempDir()
+			remote := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "seed\n"})
+			repoDir := filepath.Join(root, "workspace")
+			store := NewGitTokenStore(remote, "", "", "master")
+			store.SetBaseDir(filepath.Join(repoDir, "auths"))
+			if err := store.EnsureRepository(); err != nil {
+				t.Fatal(err)
+			}
+			exclude := filepath.Join(repoDir, ".git", "info", "exclude")
+			if err := os.MkdirAll(filepath.Dir(exclude), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			const rules = "# operator rules\r\nconfig/config.yaml\r\n"
+			if err := os.WriteFile(exclude, []byte(rules), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			const contents = "port: 8321\n"
+			if err := api.WriteConfig(store.ConfigPath(), []byte(contents)); err != nil {
+				t.Fatal(err)
+			}
+			removeHeadFileObject(t, repoDir, "corrupt-object.txt")
+			if err := store.EnsureRepository(); err != nil {
+				t.Fatal(err)
+			}
+			assertLocalFileContents(t, exclude, rules)
+			if err := store.PersistConfig(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			assertConfigPublication(t, repoDir, remote, false, contents)
+			var edited string
+			if edit == "remove" {
+				if err := os.Remove(exclude); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if edit == "negate" {
+					edited = rules + "!config/config.yaml\r\n"
+				}
+				if err := os.WriteFile(exclude, []byte(edited), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store = NewGitTokenStore(remote, "", "", "master")
+			store.SetBaseDir(filepath.Join(repoDir, "auths"))
+			removeHeadFileObject(t, repoDir, "corrupt-object.txt")
+			if err := store.PersistConfig(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			assertConfigPublication(t, repoDir, remote, true, contents)
+			if edit == "remove" {
+				if _, err := os.Lstat(exclude); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("recovery restored deleted exclude: %v", err)
+				}
+			} else {
+				assertLocalFileContents(t, exclude, edited)
+			}
+		})
+	}
+}
+
+func TestPersistConfigRepairsMissingIndexBeforeIgnoreCheck(t *testing.T) {
+	root := t.TempDir()
+	remote := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "seed\n"})
+	repoDir := filepath.Join(root, "workspace")
+	store := NewGitTokenStore(remote, "", "", "master")
+	store.SetBaseDir(filepath.Join(repoDir, "auths"))
+	if err := store.EnsureRepository(); err != nil {
+		t.Fatal(err)
+	}
+	if err := api.WriteConfig(store.ConfigPath(), []byte("port: 8317\n")); err != nil {
+		t.Fatal(err)
+	}
+	commitRecoveryFixture(t, repoDir)
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git", "info"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".git", "info", "exclude"), []byte("config/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(repoDir, ".git", "index")); err != nil {
+		t.Fatal(err)
+	}
+	const contents = "port: 8321\n"
+	if err := api.WriteConfig(store.ConfigPath(), []byte(contents)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistConfig(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertConfigPublication(t, repoDir, remote, true, contents)
+}
+
+func TestEnsureRepositoryRejectsUnsafeLocalExclude(t *testing.T) {
+	for _, layout := range []string{"git link", "info link", "exclude link", "dangling link", "info file", "exclude directory", "unreadable exclude"} {
+		t.Run(layout, func(t *testing.T) {
+			root := t.TempDir()
+			remote := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "seed\n"})
+			repoDir := filepath.Join(root, "workspace")
+			store := NewGitTokenStore(remote, "", "", "master")
+			store.SetBaseDir(filepath.Join(repoDir, "auths"))
+			if err := store.EnsureRepository(); err != nil {
+				t.Fatal(err)
+			}
+			removeHeadFileObject(t, repoDir, "corrupt-object.txt")
+			infoDir := filepath.Join(repoDir, ".git", "info")
+			if err := os.MkdirAll(infoDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			exclude := filepath.Join(infoDir, "exclude")
+			const rules = "config/config.yaml\n"
+			if err := os.WriteFile(exclude, []byte(rules), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			path := exclude
+			switch layout {
+			case "git link":
+				path = filepath.Dir(infoDir)
+			case "info link", "info file":
+				path = infoDir
+			}
+			external := filepath.Join(root, "original-metadata")
+			if err := os.Rename(path, external); err != nil {
+				t.Fatal(err)
+			}
+			switch layout {
+			case "info file":
+				if err := os.WriteFile(path, []byte("not a directory\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "exclude directory":
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "unreadable exclude":
+				if err := os.WriteFile(path, []byte(rules), 0); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				target := external
+				if layout == "dangling link" {
+					target += "-missing"
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = store.EnsureRepository()
+			if err == nil || layout != "git link" && !strings.Contains(err.Error(), "preserve local exclude") {
+				t.Fatalf("unsafe exclude recovery = %v, want preservation error", err)
+			}
+			after, err := os.Lstat(path)
+			if err != nil || !os.SameFile(before, after) {
+				t.Fatalf("rejected metadata changed: %v", err)
+			}
+			switch layout {
+			case "git link":
+				external = filepath.Join(external, "info", "exclude")
+			case "info link", "info file":
+				external = filepath.Join(external, "exclude")
+			}
+			assertLocalFileContents(t, external, rules)
+			assertRemoteTreePath(t, remote, "master", "config/config.yaml", false)
+		})
 	}
 }
 
@@ -289,6 +499,10 @@ func TestEnsureRepositoryIgnoredConfigLinkWithoutTarget(t *testing.T) {
 			if err := os.Symlink(target, store.ConfigPath()); err != nil {
 				t.Fatal(err)
 			}
+			if err := store.PersistConfig(context.Background()); err != nil {
+				t.Fatalf("persist ignored config link before corruption: %v", err)
+			}
+			assertConfigPublication(t, repoDir, remote, false, "")
 			removeHeadFileObject(t, repoDir, "corrupt-object.txt")
 			err := store.EnsureRepository()
 			if target == "config.yaml" {
@@ -515,6 +729,14 @@ func TestGitRecoveryHoldsConfigGateThroughReplacementAndRollback(t *testing.T) {
 			if err := store.EnsureRepository(); err != nil {
 				t.Fatal(err)
 			}
+			exclude := filepath.Join(repoDir, ".git", "info", "exclude")
+			if err := os.MkdirAll(filepath.Dir(exclude), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			const rules = "# local policy\r\nconfig/config.yaml\r\n"
+			if err := os.WriteFile(exclude, []byte(rules), 0o600); err != nil {
+				t.Fatal(err)
+			}
 			const original = "port: 8317\n"
 			if err := api.WriteConfig(store.ConfigPath(), []byte(original)); err != nil {
 				t.Fatal(err)
@@ -571,6 +793,7 @@ func TestGitRecoveryHoldsConfigGateThroughReplacementAndRollback(t *testing.T) {
 				if err := <-saved; err != nil {
 					t.Fatal(err)
 				}
+				assertLocalFileContents(t, exclude, rules)
 				backups, err := filepath.Glob(filepath.Join(root, ".gitstore-recovery-*"))
 				if err != nil {
 					t.Fatal(err)
@@ -585,6 +808,12 @@ func TestGitRecoveryHoldsConfigGateThroughReplacementAndRollback(t *testing.T) {
 						t.Errorf("unexpected retained backups: %v", backups)
 					}
 					assertLocalFileContents(t, store.ConfigPath(), original)
+					reopened := NewGitTokenStore(remote, "", "", "master")
+					reopened.SetBaseDir(filepath.Join(repoDir, "auths"))
+					if err := reopened.PersistConfig(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+					assertConfigPublication(t, repoDir, remote, false, original)
 				}
 			})
 		})

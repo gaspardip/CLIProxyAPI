@@ -1288,6 +1288,9 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 	// share it so a failed save restores the same inode before recovery reads it.
 	// Callers hold mu (and may hold dirLock); nothing inside may reacquire them.
 	return internalconfig.WithFileAccess(func() error {
+		if err := preserveRecoveryExclude(repoDir, cloneDir); err != nil {
+			return fmt.Errorf("preserve local exclude: %w", err)
+		}
 		if baselineTree == nil {
 			if baselineRepo != nil {
 				errClose := closeRepository(baselineRepo)
@@ -1381,6 +1384,50 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 		}
 		return nil
 	})
+}
+
+// Keep operator ignore rules in local metadata; rollback retains the original .git.
+func preserveRecoveryExclude(sourceDir, targetDir string) (errResult error) {
+	root, err := os.OpenRoot(sourceDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := root.Close(); err != nil {
+			errResult = errors.Join(errResult, fmt.Errorf("close local metadata root: %w", err))
+		}
+	}()
+	const exclude = ".git/info/exclude"
+	var mode fs.FileMode
+	for _, path := range []string{".git", ".git/info", exclude} {
+		info, err := root.Lstat(path)
+		if errors.Is(err, fs.ErrNotExist) && path != ".git" {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", path, err)
+		}
+		if path == exclude {
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("%s is not a regular file", path)
+			}
+			mode = info.Mode().Perm()
+		} else if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", path)
+		}
+	}
+	contents, err := root.ReadFile(exclude)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", exclude, err)
+	}
+	target := filepath.Join(targetDir, filepath.FromSlash(exclude))
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return fmt.Errorf("create local exclude directory: %w", err)
+	}
+	if err := os.WriteFile(target, contents, mode); err != nil {
+		return fmt.Errorf("write %s: %w", exclude, err)
+	}
+	return nil
 }
 
 // Use the same index/filesystem comparison as go-git Status, with tree entries
@@ -2210,12 +2257,11 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 	if err != nil {
 		return err
 	}
-	// Recovery replaces local exclude rules along with .git. Retain the decision.
-	ignored, err := configPathIgnored(s.repoDirSnapshot(), rel)
-	if err != nil {
+	if err := s.ensureRepositoryLocked(); err != nil {
 		return err
 	}
-	if err := s.ensureRepositoryLocked(); err != nil {
+	ignored, err := configPathIgnored(s.repoDirSnapshot(), rel)
+	if err != nil {
 		return err
 	}
 	if ignored {
@@ -2226,13 +2272,6 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 			return nil
 		}
 		return fmt.Errorf("git token store: stat config: %w", err)
-	}
-	ignored, err = configPathIgnored(s.repoDirSnapshot(), rel)
-	if err != nil {
-		return err
-	}
-	if ignored {
-		return nil
 	}
 	return s.commitAndPushLocked("Update config", rel)
 }
