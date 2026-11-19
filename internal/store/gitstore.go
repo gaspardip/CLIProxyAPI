@@ -1304,7 +1304,11 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 			baselineTree = inspectedTree
 		}
 		// Saves can change an ignored config or linked target while cloning.
-		localChanges, errLocal := recoveryWorktreeChanges(repoDir, baselineRepo, baselineTree, remoteTree, dirtyPaths)
+		configEntries, errConfig := recoveryConfigEntries(repoDir)
+		if errConfig != nil {
+			return fmt.Errorf("inspect active config: %w", errConfig)
+		}
+		localChanges, errLocal := recoveryWorktreeChanges(baselineRepo, baselineTree, remoteTree, dirtyPaths, configEntries)
 		if errLocal != nil {
 			return fmt.Errorf("inspect recovery worktree: %w", errLocal)
 		}
@@ -1313,7 +1317,7 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 		if errPreserve != nil {
 			return errPreserve
 		}
-		if errApply := applyRecoveryLocalChanges(repoDir, cloneDir, preservedPaths); errApply != nil {
+		if errApply := applyRecoveryLocalChanges(repoDir, cloneDir, preservedPaths, configEntries); errApply != nil {
 			return fmt.Errorf("preserve local worktree changes: %w", errApply)
 		}
 
@@ -1381,7 +1385,7 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 
 // Use the same index/filesystem comparison as go-git Status, with tree entries
 // instead of the possibly half-updated index. No baseline blobs are read.
-func recoveryWorktreeChanges(repoDir string, repo *git.Repository, baselineTree, remoteTree *object.Tree, prePullDirty map[string]struct{}) (map[string]struct{}, error) {
+func recoveryWorktreeChanges(repo *git.Repository, baselineTree, remoteTree *object.Tree, prePullDirty map[string]struct{}, configEntries []*gitindex.Entry) (map[string]struct{}, error) {
 	worktree, err := repo.Worktree()
 	if err != nil {
 		return nil, err
@@ -1410,10 +1414,6 @@ func recoveryWorktreeChanges(repoDir string, repo *git.Repository, baselineTree,
 		}
 		indexes[i] = idx
 		tracked.Entries = append(tracked.Entries, idx.Entries...)
-	}
-	configEntries, err := recoveryConfigEntries(repoDir)
-	if err != nil {
-		return nil, fmt.Errorf("inspect active config: %w", err)
 	}
 	// Visibility only: these entries never enter either comparison tree or Git's index.
 	tracked.Entries = append(tracked.Entries, configEntries...)
@@ -1465,6 +1465,12 @@ func recoveryConfigEntries(repoDir string) ([]*gitindex.Entry, error) {
 	if err != nil {
 		return nil, err
 	}
+	localPath := func(path string) (string, bool) {
+		rel, err := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		first, _, _ := strings.Cut(rel, "/")
+		return rel, err == nil && filepath.IsLocal(rel) && rel != "." && first != ".git"
+	}
 	dir := root
 	pending := []string{"config", "config.yaml"}
 	var entries []*gitindex.Entry
@@ -1472,15 +1478,14 @@ func recoveryConfigEntries(repoDir string) ([]*gitindex.Entry, error) {
 	for len(pending) > 0 {
 		part := pending[0]
 		pending = pending[1:]
+		if part == ".." {
+			if rel, inside := localPath(dir); inside {
+				entries = append(entries, &gitindex.Entry{Name: rel, Mode: filemode.Dir})
+			}
+		}
 		path := filepath.Join(dir, part)
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return nil, err
-		}
-		// Preserve external links themselves, never copy their targets or Git metadata.
-		if !filepath.IsLocal(rel) || part == ".git" {
-			return entries, nil
-		}
+		// Resolve outside hops too: a later link can return to the worktree.
+		rel, inside := localPath(path)
 		info, err := os.Lstat(path)
 		if errors.Is(err, fs.ErrNotExist) {
 			return entries, nil
@@ -1489,7 +1494,9 @@ func recoveryConfigEntries(repoDir string) ([]*gitindex.Entry, error) {
 			return nil, err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			entries = append(entries, &gitindex.Entry{Name: filepath.ToSlash(rel)})
+			if inside {
+				entries = append(entries, &gitindex.Entry{Name: rel})
+			}
 			links++
 			if links > 255 {
 				return nil, fmt.Errorf("too many config symlinks")
@@ -1498,26 +1505,26 @@ func recoveryConfigEntries(repoDir string) ([]*gitindex.Entry, error) {
 			if err != nil {
 				return nil, err
 			}
-			if filepath.IsAbs(target) {
-				var inside bool
-				if target == root {
-					target, inside = ".", true
-				} else {
-					target, inside = strings.CutPrefix(target, root+string(filepath.Separator))
-				}
-				if !inside {
-					return entries, nil
-				}
-				dir = root
+			volume := filepath.VolumeName(target)
+			target = target[len(volume):]
+			if volume != "" {
+				dir = volume + string(filepath.Separator)
+			} else if len(target) > 0 && os.IsPathSeparator(target[0]) {
+				dir = filepath.VolumeName(dir) + string(filepath.Separator)
 			}
-			pending = append(strings.Split(target, string(filepath.Separator)), pending...)
+			pending = append(strings.Split(filepath.ToSlash(target), "/"), pending...)
 			continue
+		}
+		if len(pending) > 0 && !info.IsDir() {
+			return nil, fmt.Errorf("config path component %s is not a directory", path)
 		}
 		if len(pending) == 0 {
 			if !info.Mode().IsRegular() {
 				return nil, fmt.Errorf("config has unsupported file mode %s", info.Mode())
 			}
-			entries = append(entries, &gitindex.Entry{Name: filepath.ToSlash(rel)})
+			if inside {
+				entries = append(entries, &gitindex.Entry{Name: rel})
+			}
 		}
 		dir = path
 	}
@@ -1576,7 +1583,7 @@ func recoveryPreservedPaths(baselineTree, remoteTree *object.Tree, dirtyPaths ma
 	return dirtyPaths, nil
 }
 
-func applyRecoveryLocalChanges(sourceDir, targetDir string, paths map[string]struct{}) (errResult error) {
+func applyRecoveryLocalChanges(sourceDir, targetDir string, paths map[string]struct{}, configEntries []*gitindex.Entry) (errResult error) {
 	targetRoot, err := os.OpenRoot(targetDir)
 	if err != nil {
 		return err
@@ -1636,6 +1643,14 @@ pathsLoop:
 			}
 		default:
 			return fmt.Errorf("local change %s has unsupported file mode %s", path, info.Mode())
+		}
+	}
+	// Git has no empty directories, but resolving a link through dir/.. needs dir.
+	for _, entry := range configEntries {
+		if entry.Mode == filemode.Dir {
+			if err := targetRoot.MkdirAll(filepath.FromSlash(entry.Name), 0o700); err != nil {
+				return fmt.Errorf("preserve config traversal directory %s: %w", entry.Name, err)
+			}
 		}
 	}
 	return nil
@@ -2187,12 +2202,24 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.ensureRepositoryLocked(); err != nil {
-		return err
-	}
 	configPath := s.ConfigPath()
 	if configPath == "" {
 		return fmt.Errorf("git token store: config path not configured")
+	}
+	rel, err := s.relativeToRepo(configPath)
+	if err != nil {
+		return err
+	}
+	// Recovery replaces local exclude rules along with .git. Retain the decision.
+	ignored, err := configPathIgnored(s.repoDirSnapshot(), rel)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureRepositoryLocked(); err != nil {
+		return err
+	}
+	if ignored {
+		return nil
 	}
 	if _, err := os.Stat(configPath); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -2200,11 +2227,55 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 		}
 		return fmt.Errorf("git token store: stat config: %w", err)
 	}
-	rel, err := s.relativeToRepo(configPath)
+	ignored, err = configPathIgnored(s.repoDirSnapshot(), rel)
 	if err != nil {
 		return err
 	}
+	if ignored {
+		return nil
+	}
 	return s.commitAndPushLocked("Update config", rel)
+}
+
+func configPathIgnored(repoDir, rel string) (ignored bool, errResult error) {
+	repo, err := git.PlainOpen(repoDir)
+	if errors.Is(err, git.ErrRepositoryNotExists) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("git token store: open repo for config ignore policy: %w", err)
+	}
+	defer func() {
+		if err := repo.Close(); err != nil {
+			errResult = errors.Join(errResult, fmt.Errorf("git token store: close config ignore repository: %w", err))
+		}
+	}()
+	index, err := repo.Storer.Index()
+	if err != nil {
+		return false, fmt.Errorf("git token store: read config index: %w", err)
+	}
+	if _, err := index.Entry(rel); err == nil {
+		return false, nil
+	} else if !errors.Is(err, gitindex.ErrEntryNotFound) {
+		return false, err
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return false, err
+	}
+	patterns, err := gitignore.ReadPatterns(worktree.Filesystem(), nil)
+	if err != nil {
+		return false, fmt.Errorf("git token store: read config ignore policy: %w", err)
+	}
+	matcher := gitignore.NewMatcher(patterns)
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for i := range parts {
+		// A negated child cannot re-include a path beneath an excluded directory.
+		if matcher.Match(parts[:i+1], i < len(parts)-1) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func ensureEmptyFile(path string) error {

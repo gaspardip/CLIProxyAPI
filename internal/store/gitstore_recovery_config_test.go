@@ -13,6 +13,7 @@ import (
 	"github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/client"
+	gitindex "github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api"
@@ -64,6 +65,11 @@ func TestEnsureRepositoryPreservesIgnoredActiveConfig(t *testing.T) {
 		{name: "absolute link", ignore: "config\nprivate/\n", target: "private/config.yaml", links: [][2]string{{"config", "$repo/private"}}},
 		{name: "absolute root link", ignore: "config\n*.yaml\n", target: "config.yaml", links: [][2]string{{"config", "$repo"}}},
 		{name: "external link", ignore: "config/\n", target: "../external.yaml", links: [][2]string{{"config/config.yaml", "../../external.yaml"}}},
+		{name: "external file returns", ignore: "config/\nprivate/\n", target: "private/settings.yaml", links: [][2]string{{"config/config.yaml", "../../external.yaml"}, {"../external.yaml", "workspace/private/settings.yaml"}}},
+		{name: "external directory returns", ignore: "config/\nprivate/\n", target: "private/config.yaml", links: [][2]string{{"config/config.yaml", "../../external/config.yaml"}, {"../external", "$repo/private"}}},
+		{name: "absolute external returns via intermediate", ignore: "config/\nprivate/\n", target: "private/settings.yaml", links: [][2]string{{"config/config.yaml", "$repo/../external.yaml"}, {"../external.yaml", "$repo/private/alias.yaml"}, {"private/alias.yaml", "settings.yaml"}}},
+		{name: "parent after directory link", ignore: "config/\nprivate/\n", target: "private/settings.yaml", links: [][2]string{{"config/config.yaml", "../../external/../settings.yaml"}, {"../external", "$repo/private/nested"}}},
+		{name: "backslash uses OS semantics", ignore: "config/\nprivate*\n*.yaml\n", target: "private\\settings.yaml", links: [][2]string{{"config/config.yaml", "../private\\settings.yaml"}}},
 	} {
 		t.Run(layout.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -87,6 +93,11 @@ func TestEnsureRepositoryPreservesIgnoredActiveConfig(t *testing.T) {
 			}
 			if err := api.WriteConfig(target, []byte("port: 8317\n")); err != nil {
 				t.Fatal(err)
+			}
+			if layout.name == "parent after directory link" {
+				if err := os.Mkdir(filepath.Join(repoDir, "private", "nested"), 0o700); err != nil {
+					t.Fatal(err)
+				}
 			}
 			for _, link := range layout.links {
 				path := filepath.Join(repoDir, link[0])
@@ -157,8 +168,103 @@ func TestEnsureRepositoryPreservesIgnoredActiveConfig(t *testing.T) {
 	}
 }
 
+func TestPersistConfigRespectsIgnorePolicy(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		for _, policy := range []struct {
+			name, ignore, nested, exclude string
+			tracked, persist              bool
+		}{
+			{name: "nonignored", persist: true},
+			{name: "file", ignore: "config/*.yaml\n"},
+			{name: "directory", ignore: "config/\n"},
+			{name: "negated file", ignore: "config/*.yaml\n!config/config.yaml\n", persist: true},
+			{name: "excluded parent wins", ignore: "config/\n!config/config.yaml\n"},
+			{name: "negated parent", ignore: "config/\n!config/\nconfig/*\n!config/config.yaml\n", persist: true},
+			{name: "nested", nested: "*.yaml\n"},
+			{name: "nested negation", ignore: "*.yaml\n", nested: "!config.yaml\n", persist: true},
+			{name: "local exclude", exclude: "config/config.yaml\n"},
+			{name: "local exclude overridden", exclude: "config/config.yaml\n", ignore: "!config/config.yaml\n", persist: true},
+			{name: "tracked ignored", ignore: "config/\n", tracked: true, persist: true},
+		} {
+			name := policy.name
+			if recovery {
+				name += " with recovery"
+			}
+			t.Run(name, func(t *testing.T) {
+				root := t.TempDir()
+				remote := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "seed\n"})
+				store := NewGitTokenStore(remote, "", "", "master")
+				repoDir := filepath.Join(root, "workspace")
+				store.SetBaseDir(filepath.Join(repoDir, "auths"))
+				if err := store.EnsureRepository(); err != nil {
+					t.Fatal(err)
+				}
+				if policy.tracked {
+					if err := api.WriteConfig(store.ConfigPath(), []byte("port: 8317\n")); err != nil {
+						t.Fatal(err)
+					}
+					commitRecoveryFixture(t, repoDir)
+				}
+				for path, contents := range map[string]string{".gitignore": policy.ignore, "config/.gitignore": policy.nested} {
+					if err := os.WriteFile(filepath.Join(repoDir, path), []byte(contents), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				commitRecoveryFixture(t, repoDir)
+				if err := os.MkdirAll(filepath.Join(repoDir, ".git", "info"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(repoDir, ".git", "info", "exclude"), []byte(policy.exclude), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				const contents = "# accepted local config\r\nport: 8321\r\n"
+				if err := api.WriteConfig(store.ConfigPath(), []byte(contents)); err != nil {
+					t.Fatal(err)
+				}
+				if recovery {
+					removeHeadFileObject(t, repoDir, "corrupt-object.txt")
+				}
+				// This is the real watcher persister, including recovery, staging and push.
+				if err := store.PersistConfig(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				assertLocalFileContents(t, store.ConfigPath(), contents)
+				repo, err := git.PlainOpen(repoDir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := repo.Close(); err != nil {
+						t.Error(err)
+					}
+				}()
+				if err := verifyRepositoryHead(repo); err != nil {
+					t.Fatalf("persistence left repository corrupt: %v", err)
+				}
+				if recovery && policy.exclude != "" {
+					if _, err := os.Lstat(filepath.Join(repoDir, ".git", "info", "exclude")); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("recovery copied local Git metadata: %v", err)
+					}
+				}
+				index, err := repo.Storer.Index()
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = index.Entry("config/config.yaml")
+				if policy.persist && err != nil || !policy.persist && !errors.Is(err, gitindex.ErrEntryNotFound) {
+					t.Errorf("config index visibility = %v, want tracked %v", err, policy.persist)
+				}
+				assertRemoteTreePath(t, remote, "master", "config/config.yaml", policy.persist)
+				if policy.persist {
+					assertRemoteFileContents(t, remote, "master", "config/config.yaml", contents)
+				}
+			})
+		}
+	}
+}
+
 func TestEnsureRepositoryIgnoredConfigLinkWithoutTarget(t *testing.T) {
-	for _, target := range []string{"missing.yaml", "config.yaml"} {
+	for _, target := range []string{"missing.yaml", "config.yaml", "../private/file/../settings.yaml", "../private/file/"} {
 		t.Run(target, func(t *testing.T) {
 			root := t.TempDir()
 			remote := setupGitRemoteRepository(t, root, "master", testBranchSpec{name: "master", contents: "seed\n"})
@@ -172,6 +278,14 @@ func TestEnsureRepositoryIgnoredConfigLinkWithoutTarget(t *testing.T) {
 				t.Fatal(err)
 			}
 			commitRecoveryFixture(t, repoDir)
+			if err := os.Mkdir(filepath.Join(repoDir, "private"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"file", "settings.yaml"} {
+				if err := os.WriteFile(filepath.Join(repoDir, "private", name), []byte("harmless fixture\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := os.Symlink(target, store.ConfigPath()); err != nil {
 				t.Fatal(err)
 			}
@@ -182,6 +296,13 @@ func TestEnsureRepositoryIgnoredConfigLinkWithoutTarget(t *testing.T) {
 					t.Fatalf("cyclic config link recovery error = %v", err)
 				}
 				assertLocalFileContents(t, filepath.Join(repoDir, "corrupt-object.txt"), "corrupt me\n")
+			} else if strings.HasPrefix(target, "../private/file/") {
+				if err == nil || !strings.Contains(err.Error(), "not a directory") {
+					t.Fatalf("non-directory path component recovery error = %v", err)
+				}
+				assertLocalFileContents(t, filepath.Join(repoDir, "corrupt-object.txt"), "corrupt me\n")
+				assertLocalFileContents(t, filepath.Join(repoDir, "private", "file"), "harmless fixture\n")
+				assertLocalFileContents(t, filepath.Join(repoDir, "private", "settings.yaml"), "harmless fixture\n")
 			} else if err != nil {
 				t.Fatal(err)
 			}
