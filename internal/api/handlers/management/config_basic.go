@@ -2,6 +2,7 @@ package management
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -125,24 +126,104 @@ func prepareConfigWrite(data []byte) ([]byte, error) {
 	return config.NormalizeCommentIndentation(data), nil
 }
 
-// Keep the inode for mounted configuration files; write the validated bytes unchanged.
+type configWriteFile interface {
+	io.Reader
+	io.WriterAt
+	Stat() (os.FileInfo, error)
+	Truncate(int64) error
+	Sync() error
+	Close() error
+}
+
+var openConfigWriteFile = func(path string, flag int, perm os.FileMode) (configWriteFile, error) {
+	return os.OpenFile(path, flag, perm)
+}
+
+// Keep the inode for mounts and watchers. Restoration is best effort, not an
+// atomic replacement: readers may observe writes, and storage can fail again.
 func writePreparedConfig(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err := openConfigWriteFile(path, os.O_RDWR, 0)
+	created := false
+	if os.IsNotExist(err) {
+		f, err = openConfigWriteFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+		if os.IsExist(err) {
+			// Exclusive creation does not follow a dangling final symlink.
+			target, errLink := os.Readlink(path)
+			if errLink != nil {
+				return errors.Join(err, errLink)
+			}
+			if !filepath.IsAbs(target) {
+				target = filepath.Dir(path) + string(os.PathSeparator) + target
+			}
+			return writePreparedConfig(target, data)
+		}
+		created = err == nil
+	}
 	if err != nil {
 		return err
 	}
-	if _, errWrite := f.Write(data); errWrite != nil {
-		_ = f.Close()
-		return errWrite
+	info, err := f.Stat()
+	if err != nil {
+		return errors.Join(fmt.Errorf("cannot identify opened config; on-disk state is uncertain: %w", err), f.Close())
 	}
-	if errSync := f.Sync(); errSync != nil {
-		_ = f.Close()
-		return errSync
+	if !info.Mode().IsRegular() {
+		return errors.Join(errors.New("config is not a regular file"), f.Close())
 	}
-	if errClose := f.Close(); errClose != nil {
-		return errClose
+	var previous []byte
+	if !created {
+		previous, err = io.ReadAll(f)
+		if err != nil {
+			return errors.Join(err, f.Close())
+		}
 	}
-	return nil
+	err = errors.Join(replaceConfigBytes(f, data), f.Close())
+	if err == nil {
+		return nil
+	}
+	if errRestore := restoreConfigFile(path, previous, info, created); errRestore != nil {
+		return errors.Join(err, fmt.Errorf("restore config failed; on-disk state is uncertain: %w", errRestore))
+	}
+	return err
+}
+
+func replaceConfigBytes(f configWriteFile, data []byte) error {
+	n, err := f.WriteAt(data, 0)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	if err = f.Truncate(int64(len(data))); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+func restoreConfigFile(path string, previous []byte, info os.FileInfo, created bool) error {
+	if created {
+		current, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(info, current) {
+			return errors.New("config file changed before cleanup")
+		}
+		return os.Remove(path)
+	}
+	// Reopen even after a failed Close; that descriptor may already be closed.
+	f, err := openConfigWriteFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	current, err := f.Stat()
+	if err == nil && !os.SameFile(info, current) {
+		err = errors.New("config file changed before restoration")
+	}
+	if err == nil {
+		err = replaceConfigBytes(f, previous)
+	}
+	return errors.Join(err, f.Close())
 }
 
 func (h *Handler) PutConfigYAML(c *gin.Context) {
@@ -206,7 +287,7 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		return
 	}
 	if err = writePreparedConfig(h.configFilePath, prepared); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": "failed to write config"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "write_failed", "message": err.Error()})
 		return
 	}
 	h.cfg = validated

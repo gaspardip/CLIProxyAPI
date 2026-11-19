@@ -182,3 +182,17 @@ saves leave the file and the handler's config unchanged. A rejected config file
 is not adopted by the watcher, so no credentials are refreshed from it.
 Without a validator, behavior is unchanged. For example, an embedding application can require API
 keys, a private bind address, and disabled scheduler plugins for its quota policy.
+
+Full-document v0 saves, v8 config writes, and `sdk/api.WriteConfig` keep the config
+file's inode for file mounts and watchers. Existing regular files must be readable
+and writable so the writer can snapshot their bytes before changing them. A failed
+write, truncate, sync, or close attempts to restore those bytes and sync them on the
+same inode; a failed new-file save attempts to remove the file it created.
+Recoverable failures retain the previous disk bytes, management runtime snapshot, and ETag. Existing
+permissions and links are preserved. If restoration or cleanup also fails, the
+returned error explicitly reports that on-disk state is uncertain.
+
+This in-place write is not atomic for independent readers or writers. A process
+crash, power loss, or persistent storage failure can prevent recovery; no durability
+or runtime isolation across those failures is guaranteed. A detected replacement
+inode is left untouched and reported as a restoration failure.
