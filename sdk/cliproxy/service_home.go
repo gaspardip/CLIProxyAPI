@@ -387,6 +387,10 @@ func applyHomeInFlightPublisherConfig(manager *coreauth.Manager, cfg internalcon
 }
 
 func (s *Service) startHomeSubscriber(ctx context.Context) {
+	s.startHomeSubscriberWithRetryWait(ctx, waitForHomeSubscriberRetry)
+}
+
+func (s *Service) startHomeSubscriberWithRetryWait(ctx context.Context, waitRetry func(context.Context, time.Duration) bool) {
 	if s == nil {
 		return
 	}
@@ -427,7 +431,7 @@ func (s *Service) startHomeSubscriber(ctx context.Context) {
 	s.homeMu.Unlock()
 	supervisor := &homeSubscriberSupervisor{cancel: cancel, done: done}
 	s.homeSupervisor = supervisor
-	go s.runHomeSubscriber(homeCtx, parentCtx, cfg.Home, generation, supervisor)
+	go s.runHomeSubscriber(homeCtx, parentCtx, cfg.Home, generation, supervisor, waitRetry)
 }
 
 func (s *Service) drainDetachedHomeLifetime(parentCtx context.Context) bool {
@@ -481,7 +485,7 @@ func (s *Service) drainDetachedHomeLifetime(parentCtx context.Context) bool {
 	return true
 }
 
-func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.Context, homeCfg internalconfig.HomeConfig, generation uint64, supervisor *homeSubscriberSupervisor) {
+func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.Context, homeCfg internalconfig.HomeConfig, generation uint64, supervisor *homeSubscriberSupervisor, waitRetry func(context.Context, time.Duration) bool) {
 	defer func() {
 		s.homeMu.Lock()
 		if s.homeGeneration == generation {
@@ -626,7 +630,7 @@ func (s *Service) runHomeSubscriber(homeCtx context.Context, parentCtx context.C
 			} else {
 				log.Warnf("home config subscription lifetime ended; retrying in %s: %v", retryDelay, errRun)
 			}
-			if retryDelay > 0 && !waitForHomeSubscriberRetry(homeCtx, retryDelay) {
+			if retryDelay > 0 && !waitRetry(homeCtx, retryDelay) {
 				return
 			}
 			previousClient = client

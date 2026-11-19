@@ -1416,7 +1416,27 @@ func TestServiceHeartbeatFailoverDoesNotDrainBlockingScope(t *testing.T) {
 	service.homeMu.Lock()
 	service.runCancel = cancelService
 	service.homeMu.Unlock()
-	service.startHomeSubscriber(serviceCtx)
+	// Hold the real heartbeat-loss path at its retry wait. Random backoff is
+	// covered separately and must not consume the failover assertion's deadline.
+	retryStarted := make(chan time.Duration, 1)
+	allowRetry := make(chan struct{})
+	service.startHomeSubscriberWithRetryWait(serviceCtx, func(ctx context.Context, delay time.Duration) bool {
+		select {
+		case retryStarted <- delay:
+		case <-ctx.Done():
+			return false
+		}
+		select {
+		case <-allowRetry:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	})
+	t.Cleanup(func() {
+		cancelService()
+		<-service.homeSupervisor.done
+	})
 
 	select {
 	case <-firstAck:
@@ -1434,6 +1454,10 @@ func TestServiceHeartbeatFailoverDoesNotDrainBlockingScope(t *testing.T) {
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
+	t.Cleanup(func() {
+		close(release)
+		scope.End("test cleanup")
+	})
 	if errBind := scope.Bind(func() error {
 		close(started)
 		<-release
@@ -1444,11 +1468,24 @@ func TestServiceHeartbeatFailoverDoesNotDrainBlockingScope(t *testing.T) {
 
 	close(loseFirst)
 	select {
+	case delay := <-retryStarted:
+		if delay < homeSubscriberRetryInitial/2 || delay > homeSubscriberRetryInitial {
+			t.Fatalf("first retry delay = %v, want between %v and %v", delay, homeSubscriberRetryInitial/2, homeSubscriberRetryInitial)
+		}
+	case <-started:
+		t.Fatal("heartbeat failover started draining the blocking scope")
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat loss did not reach the retry wait")
+	}
+	select {
 	case <-started:
 		t.Fatal("heartbeat failover started draining the blocking scope")
 	case <-time.After(50 * time.Millisecond):
 	}
+	close(allowRetry)
 	select {
+	case <-started:
+		t.Fatal("heartbeat failover started draining the blocking scope")
 	case <-secondSubscribe:
 	case <-time.After(time.Second):
 		t.Fatal("new subscription did not start while the old scope remained active")
@@ -1469,8 +1506,11 @@ func TestServiceHeartbeatFailoverDoesNotDrainBlockingScope(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	close(release)
-	scope.End("test cleanup")
+	select {
+	case <-started:
+		t.Fatal("heartbeat failover drained the blocking scope")
+	default:
+	}
 }
 
 func TestServiceShutdownDrainsDetachedRegistryDuringRetry(t *testing.T) {
