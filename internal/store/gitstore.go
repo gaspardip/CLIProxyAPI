@@ -1,10 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -18,12 +20,16 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/client"
 	"github.com/go-git/go-git/v6/plumbing/filemode"
-	gitformat "github.com/go-git/go-git/v6/plumbing/format/config"
+	"github.com/go-git/go-git/v6/plumbing/format/gitignore"
 	gitindex "github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
 	"github.com/go-git/go-git/v6/storage/filesystem/dotgit"
+	"github.com/go-git/go-git/v6/utils/merkletrie"
+	"github.com/go-git/go-git/v6/utils/merkletrie/filesystem"
+	mindex "github.com/go-git/go-git/v6/utils/merkletrie/index"
+	"github.com/go-git/go-git/v6/utils/merkletrie/noder"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -1290,29 +1296,20 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 					return fmt.Errorf("close recovery caller repository before baseline inspection: %w", errClose)
 				}
 			}
-			inspectedRepo, inspectedTree, inspectedDirtyPaths, errInspect := inspectRecoveryBaseline(repoDir)
+			inspectedRepo, inspectedTree, _, errInspect := inspectRecoveryBaseline(repoDir)
 			if errInspect != nil {
 				return fmt.Errorf("inspect recovery baseline: %w", errInspect)
 			}
 			baselineRepo = inspectedRepo
 			baselineTree = inspectedTree
-			dirtyPaths = inspectedDirtyPaths
 		}
-		// Management saves do not take mu, so the pre-pull dirty set can be stale.
-		configDirty, errConfig := recoveryConfigChanged(repoDir, baselineTree, remoteTree)
-		if errConfig != nil {
-			return fmt.Errorf("inspect recovery config: %w", errConfig)
-		}
-		if configDirty {
-			if dirtyPaths == nil {
-				dirtyPaths = make(map[string]struct{})
-			}
-			dirtyPaths["config/config.yaml"] = struct{}{}
-		} else {
-			delete(dirtyPaths, "config/config.yaml")
+		// Saves can change any tracked target through a config link while cloning.
+		localChanges, errLocal := recoveryWorktreeChanges(baselineRepo, baselineTree, remoteTree, dirtyPaths)
+		if errLocal != nil {
+			return fmt.Errorf("inspect recovery worktree: %w", errLocal)
 		}
 
-		preservedPaths, errPreserve := recoveryPreservedPaths(baselineTree, remoteTree, dirtyPaths)
+		preservedPaths, errPreserve := recoveryPreservedPaths(baselineTree, remoteTree, localChanges)
 		if errPreserve != nil {
 			return errPreserve
 		}
@@ -1382,56 +1379,79 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 	})
 }
 
-// Compare file identities without loading baseline blobs, which may be corrupt.
-func recoveryConfigChanged(repoDir string, baselineTree, remoteTree *object.Tree) (bool, error) {
-	const path = "config/config.yaml"
-	local := object.TreeEntry{}
-	fullPath := filepath.Join(repoDir, filepath.FromSlash(path))
-	info, err := os.Lstat(fullPath)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return false, err
+// Use the same index/filesystem comparison as go-git Status, with tree entries
+// instead of the possibly half-updated index. No baseline blobs are read.
+func recoveryWorktreeChanges(repo *git.Repository, baselineTree, remoteTree *object.Tree, prePullDirty map[string]struct{}) (map[string]struct{}, error) {
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return nil, err
 	}
-	if err == nil {
-		var contents []byte
-		switch {
-		case info.Mode().IsRegular():
-			contents, err = os.ReadFile(fullPath)
-		case info.Mode()&os.ModeSymlink != 0:
-			var target string
-			target, err = os.Readlink(fullPath)
-			contents = []byte(target)
-		default:
-			return false, fmt.Errorf("config has unsupported file mode %s", info.Mode())
+	cfg, err := repo.Config()
+	if err != nil {
+		return nil, err
+	}
+	var indexes [2]*gitindex.Index
+	tracked := &gitindex.Index{Version: 2}
+	for i, tree := range []*object.Tree{baselineTree, remoteTree} {
+		idx := &gitindex.Index{Version: 2}
+		walker := object.NewTreeWalker(tree, true, nil)
+		defer walker.Close()
+		for {
+			path, entry, err := walker.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			if entry.Mode != filemode.Dir {
+				idx.Entries = append(idx.Entries, &gitindex.Entry{Name: path, Hash: entry.Hash, Mode: entry.Mode})
+			}
 		}
+		indexes[i] = idx
+		tracked.Entries = append(tracked.Entries, idx.Entries...)
+	}
+	patterns, err := gitignore.ReadPatterns(worktree.Filesystem(), nil)
+	if err != nil {
+		return nil, err
+	}
+	// Both comparisons must see entries tracked by either tree, even if ignored.
+	options := filesystem.Options{
+		AutoCRLF:      cfg.Core.AutoCRLF == "true" || cfg.Core.AutoCRLF == "input",
+		Index:         tracked,
+		IgnoreMatcher: gitignore.NewMatcher(patterns),
+	}
+	var changed [2]map[string]struct{}
+	for i, idx := range indexes {
+		local := filesystem.NewRootNodeWithOptions(worktree.Filesystem(), nil, options)
+		from := mindex.NewRootNodeWithOptions(idx, mindex.RootNodeOptions{UpholdExecutableBit: cfg.Core.FileMode})
+		changes, err := merkletrie.DiffTree(from, local, func(a, b noder.Hasher) bool {
+			hashA, hashB := a.Hash(), b.Hash()
+			return !bytes.Equal(hashA, make([]byte, 24)) && bytes.Equal(hashA, hashB)
+		})
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		format := gitformat.SHA1
-		if baselineTree.Hash.Size() == gitformat.SHA256Size {
-			format = gitformat.SHA256
-		}
-		local.Hash, err = plumbing.FromObjectFormat(format).Compute(plumbing.BlobObject, contents)
-		if err != nil {
-			return false, err
-		}
-		local.Mode, err = filemode.NewFromOSFileMode(info.Mode())
-		if err != nil {
-			return false, err
+		changed[i] = make(map[string]struct{}, len(changes))
+		for _, change := range changes {
+			for _, path := range []string{change.From.String(), change.To.String()} {
+				if path != "" {
+					changed[i][path] = struct{}{}
+				}
+			}
 		}
 	}
-	for _, tree := range []*object.Tree{baselineTree, remoteTree} {
-		entry, errEntry := tree.FindEntry(path)
-		if errors.Is(errEntry, object.ErrEntryNotFound) || errors.Is(errEntry, object.ErrDirectoryNotFound) {
-			entry = &object.TreeEntry{}
-		} else if errEntry != nil {
-			return false, errEntry
-		}
-		// A partially completed pull may already have installed the remote config.
-		if local.Hash == entry.Hash && local.Mode == entry.Mode {
-			return false, nil
+	localChanges, remoteChanges := changed[0], changed[1]
+	for path := range localChanges {
+		// A partial pull may have installed remote entries; pre-pull local
+		// changes must still take part in conflict detection.
+		if _, wasDirty := prePullDirty[path]; !wasDirty {
+			if _, differsFromRemote := remoteChanges[path]; !differsFromRemote {
+				delete(localChanges, path)
+			}
 		}
 	}
-	return true, nil
+	return localChanges, nil
 }
 
 func inspectRecoveryBaseline(repoDir string) (repoResult *git.Repository, treeResult *object.Tree, dirtyResult map[string]struct{}, errResult error) {
@@ -1486,18 +1506,34 @@ func recoveryPreservedPaths(baselineTree, remoteTree *object.Tree, dirtyPaths ma
 	return dirtyPaths, nil
 }
 
-func applyRecoveryLocalChanges(sourceDir, targetDir string, paths map[string]struct{}) error {
+func applyRecoveryLocalChanges(sourceDir, targetDir string, paths map[string]struct{}) (errResult error) {
+	targetRoot, err := os.OpenRoot(targetDir)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := targetRoot.Close(); err != nil {
+			errResult = errors.Join(errResult, fmt.Errorf("close recovery worktree: %w", err))
+		}
+	}()
 	sortedPaths := make([]string, 0, len(paths))
 	for path := range paths {
 		sortedPaths = append(sortedPaths, path)
 	}
 	sort.Strings(sortedPaths)
+pathsLoop:
 	for _, path := range sortedPaths {
+		// A replaced directory link is one entry, not a set of target files.
+		for parent := filepath.ToSlash(filepath.Dir(path)); parent != "."; parent = filepath.ToSlash(filepath.Dir(parent)) {
+			if _, replaced := paths[parent]; replaced {
+				continue pathsLoop
+			}
+		}
 		source := filepath.Join(sourceDir, filepath.FromSlash(path))
-		target := filepath.Join(targetDir, filepath.FromSlash(path))
+		target := filepath.FromSlash(path)
 		info, errStat := os.Lstat(source)
 		if errors.Is(errStat, fs.ErrNotExist) {
-			if errRemove := os.RemoveAll(target); errRemove != nil {
+			if errRemove := targetRoot.RemoveAll(target); errRemove != nil {
 				return fmt.Errorf("preserve deletion %s: %w", path, errRemove)
 			}
 			continue
@@ -1505,10 +1541,10 @@ func applyRecoveryLocalChanges(sourceDir, targetDir string, paths map[string]str
 		if errStat != nil {
 			return fmt.Errorf("inspect local change %s: %w", path, errStat)
 		}
-		if errRemove := os.RemoveAll(target); errRemove != nil {
+		if errRemove := targetRoot.RemoveAll(target); errRemove != nil {
 			return fmt.Errorf("replace recovered path %s: %w", path, errRemove)
 		}
-		if errMkdir := os.MkdirAll(filepath.Dir(target), 0o700); errMkdir != nil {
+		if errMkdir := targetRoot.MkdirAll(filepath.Dir(target), 0o700); errMkdir != nil {
 			return fmt.Errorf("create recovered parent for %s: %w", path, errMkdir)
 		}
 		switch {
@@ -1517,7 +1553,7 @@ func applyRecoveryLocalChanges(sourceDir, targetDir string, paths map[string]str
 			if errRead != nil {
 				return fmt.Errorf("read local change %s: %w", path, errRead)
 			}
-			if errWrite := os.WriteFile(target, contents, info.Mode().Perm()); errWrite != nil {
+			if errWrite := targetRoot.WriteFile(target, contents, info.Mode().Perm()); errWrite != nil {
 				return fmt.Errorf("write local change %s: %w", path, errWrite)
 			}
 		case info.Mode()&os.ModeSymlink != 0:
@@ -1525,7 +1561,7 @@ func applyRecoveryLocalChanges(sourceDir, targetDir string, paths map[string]str
 			if errReadlink != nil {
 				return fmt.Errorf("read local symlink %s: %w", path, errReadlink)
 			}
-			if errSymlink := os.Symlink(linkTarget, target); errSymlink != nil {
+			if errSymlink := targetRoot.Symlink(linkTarget, target); errSymlink != nil {
 				return fmt.Errorf("write local symlink %s: %w", path, errSymlink)
 			}
 		default:
