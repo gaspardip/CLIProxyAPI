@@ -17,6 +17,8 @@ import (
 	"github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/client"
+	"github.com/go-git/go-git/v6/plumbing/filemode"
+	gitformat "github.com/go-git/go-git/v6/plumbing/format/config"
 	gitindex "github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
@@ -1237,23 +1239,7 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 		}
 	}()
 
-	var baselineRepo *git.Repository
-	if baselineTree == nil {
-		if callerRepo != nil {
-			if errClose := closeRepository(callerRepo); errClose != nil {
-				return fmt.Errorf("close recovery caller repository before baseline inspection: %w", errClose)
-			}
-		}
-		inspectedRepo, inspectedTree, inspectedDirtyPaths, errInspect := inspectRecoveryBaseline(repoDir)
-		if errInspect != nil {
-			return fmt.Errorf("inspect recovery baseline: %w", errInspect)
-		}
-		baselineRepo = inspectedRepo
-		baselineTree = inspectedTree
-		dirtyPaths = inspectedDirtyPaths
-	} else {
-		baselineRepo = callerRepo
-	}
+	baselineRepo := callerRepo
 
 	cloneDir := filepath.Join(recoveryRoot, "clone")
 	cloneOpts := &git.CloneOptions{ClientOptions: authMethod, URL: s.remote}
@@ -1292,73 +1278,160 @@ func (s *GitTokenStore) recoverRepositoryContextLocked(ctx context.Context, repo
 	if errTree != nil {
 		return fmt.Errorf("inspect cloned repository tree: %w", errTree)
 	}
-	preservedPaths, errPreserve := recoveryPreservedPaths(baselineTree, remoteTree, dirtyPaths)
-	if errPreserve != nil {
-		return errPreserve
-	}
-	if errApply := applyRecoveryLocalChanges(repoDir, cloneDir, preservedPaths); errApply != nil {
-		return fmt.Errorf("preserve local worktree changes: %w", errApply)
-	}
+	// Clone without the config gate; local capture, replacement and rollback must
+	// share it so a failed save restores the same inode before recovery reads it.
+	// Callers hold mu (and may hold dirLock); nothing inside may reacquire them.
+	return internalconfig.WithFileAccess(func() error {
+		if baselineTree == nil {
+			if baselineRepo != nil {
+				errClose := closeRepository(baselineRepo)
+				baselineRepo = nil
+				if errClose != nil {
+					return fmt.Errorf("close recovery caller repository before baseline inspection: %w", errClose)
+				}
+			}
+			inspectedRepo, inspectedTree, inspectedDirtyPaths, errInspect := inspectRecoveryBaseline(repoDir)
+			if errInspect != nil {
+				return fmt.Errorf("inspect recovery baseline: %w", errInspect)
+			}
+			baselineRepo = inspectedRepo
+			baselineTree = inspectedTree
+			dirtyPaths = inspectedDirtyPaths
+		}
+		// Management saves do not take mu, so the pre-pull dirty set can be stale.
+		configDirty, errConfig := recoveryConfigChanged(repoDir, baselineTree, remoteTree)
+		if errConfig != nil {
+			return fmt.Errorf("inspect recovery config: %w", errConfig)
+		}
+		if configDirty {
+			if dirtyPaths == nil {
+				dirtyPaths = make(map[string]struct{})
+			}
+			dirtyPaths["config/config.yaml"] = struct{}{}
+		} else {
+			delete(dirtyPaths, "config/config.yaml")
+		}
 
-	errClose := closeRecoveryRepositories(closeRepository, baselineRepo, clonedRepo)
-	baselineRepo = nil
-	clonedRepo = nil
-	if errClose != nil {
-		return errClose
-	}
+		preservedPaths, errPreserve := recoveryPreservedPaths(baselineTree, remoteTree, dirtyPaths)
+		if errPreserve != nil {
+			return errPreserve
+		}
+		if errApply := applyRecoveryLocalChanges(repoDir, cloneDir, preservedPaths); errApply != nil {
+			return fmt.Errorf("preserve local worktree changes: %w", errApply)
+		}
 
-	backupWorktreeDir := filepath.Join(recoveryRoot, "worktree")
-	retainWorktreeBackup, errBackup := moveWorktreeEntries(repoDir, backupWorktreeDir, renameWorktreeEntry)
-	if errBackup != nil {
-		if retainWorktreeBackup {
+		errClose := closeRecoveryRepositories(closeRepository, baselineRepo, clonedRepo)
+		baselineRepo = nil
+		clonedRepo = nil
+		if errClose != nil {
+			return errClose
+		}
+
+		backupWorktreeDir := filepath.Join(recoveryRoot, "worktree")
+		retainWorktreeBackup, errBackup := moveWorktreeEntries(repoDir, backupWorktreeDir, renameWorktreeEntry)
+		if errBackup != nil {
+			if retainWorktreeBackup {
+				cleanupRecovery = false
+				return fmt.Errorf("backup existing worktree; backup retained at %s: %w", backupWorktreeDir, errBackup)
+			}
+			return fmt.Errorf("backup existing worktree: %w", errBackup)
+		}
+		gitDir := filepath.Join(repoDir, ".git")
+		clonedGitDir := filepath.Join(cloneDir, ".git")
+		backupGitDir := filepath.Join(recoveryRoot, "corrupt.git")
+		retainRecovery, errInstall := installRecoveredGitDirectory(gitDir, clonedGitDir, backupGitDir, os.Rename)
+		if retainRecovery {
 			cleanupRecovery = false
-			return fmt.Errorf("backup existing worktree; backup retained at %s: %w", backupWorktreeDir, errBackup)
 		}
-		return fmt.Errorf("backup existing worktree: %w", errBackup)
-	}
-	gitDir := filepath.Join(repoDir, ".git")
-	clonedGitDir := filepath.Join(cloneDir, ".git")
-	backupGitDir := filepath.Join(recoveryRoot, "corrupt.git")
-	retainRecovery, errInstall := installRecoveredGitDirectory(gitDir, clonedGitDir, backupGitDir, os.Rename)
-	if retainRecovery {
-		cleanupRecovery = false
-	}
-	if errInstall != nil {
-		if _, errRestore := moveWorktreeEntries(backupWorktreeDir, repoDir, renameWorktreeEntry); errRestore != nil {
-			cleanupRecovery = false
-			return errors.Join(errInstall, fmt.Errorf("restore worktree; backup retained at %s: %w", backupWorktreeDir, errRestore))
+		if errInstall != nil {
+			if _, errRestore := moveWorktreeEntries(backupWorktreeDir, repoDir, renameWorktreeEntry); errRestore != nil {
+				cleanupRecovery = false
+				return errors.Join(errInstall, fmt.Errorf("restore worktree; backup retained at %s: %w", backupWorktreeDir, errRestore))
+			}
+			return errInstall
 		}
-		return errInstall
-	}
-	if _, errMove := moveWorktreeEntries(cloneDir, repoDir, renameWorktreeEntry); errMove != nil {
-		errMoveWorktree := fmt.Errorf("install recovered worktree: %w", errMove)
-		if errRollback := rollbackRecoveredRepository(repoDir, gitDir, backupGitDir, backupWorktreeDir, renameWorktreeEntry); errRollback != nil {
-			cleanupRecovery = false
-			return errors.Join(errMoveWorktree, fmt.Errorf("rollback recovered repository; backup retained at %s: %w", recoveryRoot, errRollback))
+		if _, errMove := moveWorktreeEntries(cloneDir, repoDir, renameWorktreeEntry); errMove != nil {
+			errMoveWorktree := fmt.Errorf("install recovered worktree: %w", errMove)
+			if errRollback := rollbackRecoveredRepository(repoDir, gitDir, backupGitDir, backupWorktreeDir, renameWorktreeEntry); errRollback != nil {
+				cleanupRecovery = false
+				return errors.Join(errMoveWorktree, fmt.Errorf("rollback recovered repository; backup retained at %s: %w", recoveryRoot, errRollback))
+			}
+			return errMoveWorktree
 		}
-		return errMoveWorktree
+		recoveredRepo, errOpen := git.PlainOpen(repoDir)
+		if errOpen == nil {
+			errVerify := verifyRepositoryHead(recoveredRepo)
+			errClose := closeRepository(recoveredRepo)
+			if errVerify != nil && errClose != nil {
+				errOpen = errors.Join(errVerify, fmt.Errorf("close recovered repository: %w", errClose))
+			} else if errVerify != nil {
+				errOpen = errVerify
+			} else if errClose != nil {
+				errOpen = fmt.Errorf("close recovered repository: %w", errClose)
+			}
+		}
+		if errOpen != nil {
+			errRecovered := fmt.Errorf("verify recovered repository: %w", errOpen)
+			if errRollback := rollbackRecoveredRepository(repoDir, gitDir, backupGitDir, backupWorktreeDir, renameWorktreeEntry); errRollback != nil {
+				cleanupRecovery = false
+				return errors.Join(errRecovered, fmt.Errorf("rollback recovered repository; backup retained at %s: %w", recoveryRoot, errRollback))
+			}
+			return errRecovered
+		}
+		return nil
+	})
+}
+
+// Compare file identities without loading baseline blobs, which may be corrupt.
+func recoveryConfigChanged(repoDir string, baselineTree, remoteTree *object.Tree) (bool, error) {
+	const path = "config/config.yaml"
+	local := object.TreeEntry{}
+	fullPath := filepath.Join(repoDir, filepath.FromSlash(path))
+	info, err := os.Lstat(fullPath)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false, err
 	}
-	recoveredRepo, errOpen := git.PlainOpen(repoDir)
-	if errOpen == nil {
-		errVerify := verifyRepositoryHead(recoveredRepo)
-		errClose := closeRepository(recoveredRepo)
-		if errVerify != nil && errClose != nil {
-			errOpen = errors.Join(errVerify, fmt.Errorf("close recovered repository: %w", errClose))
-		} else if errVerify != nil {
-			errOpen = errVerify
-		} else if errClose != nil {
-			errOpen = fmt.Errorf("close recovered repository: %w", errClose)
+	if err == nil {
+		var contents []byte
+		switch {
+		case info.Mode().IsRegular():
+			contents, err = os.ReadFile(fullPath)
+		case info.Mode()&os.ModeSymlink != 0:
+			var target string
+			target, err = os.Readlink(fullPath)
+			contents = []byte(target)
+		default:
+			return false, fmt.Errorf("config has unsupported file mode %s", info.Mode())
+		}
+		if err != nil {
+			return false, err
+		}
+		format := gitformat.SHA1
+		if baselineTree.Hash.Size() == gitformat.SHA256Size {
+			format = gitformat.SHA256
+		}
+		local.Hash, err = plumbing.FromObjectFormat(format).Compute(plumbing.BlobObject, contents)
+		if err != nil {
+			return false, err
+		}
+		local.Mode, err = filemode.NewFromOSFileMode(info.Mode())
+		if err != nil {
+			return false, err
 		}
 	}
-	if errOpen != nil {
-		errRecovered := fmt.Errorf("verify recovered repository: %w", errOpen)
-		if errRollback := rollbackRecoveredRepository(repoDir, gitDir, backupGitDir, backupWorktreeDir, renameWorktreeEntry); errRollback != nil {
-			cleanupRecovery = false
-			return errors.Join(errRecovered, fmt.Errorf("rollback recovered repository; backup retained at %s: %w", recoveryRoot, errRollback))
+	for _, tree := range []*object.Tree{baselineTree, remoteTree} {
+		entry, errEntry := tree.FindEntry(path)
+		if errors.Is(errEntry, object.ErrEntryNotFound) || errors.Is(errEntry, object.ErrDirectoryNotFound) {
+			entry = &object.TreeEntry{}
+		} else if errEntry != nil {
+			return false, errEntry
 		}
-		return errRecovered
+		// A partially completed pull may already have installed the remote config.
+		if local.Hash == entry.Hash && local.Mode == entry.Mode {
+			return false, nil
+		}
 	}
-	return nil
+	return true, nil
 }
 
 func inspectRecoveryBaseline(repoDir string) (repoResult *git.Repository, treeResult *object.Tree, dirtyResult map[string]struct{}, errResult error) {
