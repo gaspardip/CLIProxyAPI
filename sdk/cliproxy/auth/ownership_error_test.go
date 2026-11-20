@@ -67,6 +67,9 @@ func TestOwnershipConflictLeavesReplacementUnchanged(t *testing.T) {
 						t.Fatal(err)
 					}
 					before, _ = m.GetByID(base.ID)
+					if before.RejectedAccessToken != "" || before.RejectedSIWCAccessToken != "" {
+						t.Fatal("replacement inherited old owner token rejection")
+					}
 					disk = store.lastAuth()
 					records = cooldowns.getRecords()
 					saves = store.saveCount.Load()
@@ -165,5 +168,36 @@ func TestReplacementSaveDoesNotAdoptOldOwnerRefreshFailure(t *testing.T) {
 		if authMetadataString(a, "email") != "new@example.com" || a.LastError != nil || a.RefreshError != nil || a.Unavailable || a.Status != StatusActive {
 			t.Error("replacement adopted old owner's runtime failure")
 		}
+	}
+}
+
+func TestReplacementClearsBothAccessTokenRejections(t *testing.T) {
+	for _, email := range []string{"owner@example.com", "replacement@example.com"} {
+		t.Run(email, func(t *testing.T) {
+			ctx := context.Background()
+			store := &requestPrepareStore{}
+			m := NewManager(store, nil, nil)
+			a, err := m.Register(ctx, &Auth{ID: "fixture", Provider: "codex", RejectedAccessToken: "outer", RejectedSIWCAccessToken: "inner", Metadata: map[string]any{
+				"email": "owner@example.com", "access_token": "outer",
+				"siwc": map[string]any{"access_token": "inner"},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.Metadata["email"] = email
+			if _, err := m.Update(ctx, a); err != nil {
+				t.Fatal(err)
+			}
+			current, _ := m.GetByID(a.ID)
+			for _, saved := range []*Auth{current, store.lastAuth()} {
+				if email == "owner@example.com" {
+					if saved.RejectedAccessToken != "outer" || saved.RejectedSIWCAccessToken != "inner" {
+						t.Fatal("same owner lost token rejections")
+					}
+				} else if saved.RejectedAccessToken != "" || saved.RejectedSIWCAccessToken != "" {
+					t.Fatal("replacement inherited token rejections")
+				}
+			}
+		})
 	}
 }

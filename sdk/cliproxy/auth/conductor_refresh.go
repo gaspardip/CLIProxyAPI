@@ -107,12 +107,17 @@ func (m *Manager) queueRefreshUnschedule(authID string) {
 		return
 	}
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	loop := m.refreshLoop
-	m.mu.RUnlock()
 	if loop == nil {
 		return
 	}
-	loop.remove(authID)
+	// A late terminal result must recompute the replacement's schedule.
+	if m.auths[authID] != nil {
+		loop.queueReschedule(authID)
+	} else {
+		loop.remove(authID)
+	}
 }
 
 // codexAutoRefreshUnavailable mirrors the executor's local renewal requirements.

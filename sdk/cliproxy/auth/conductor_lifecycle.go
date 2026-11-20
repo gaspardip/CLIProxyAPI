@@ -539,6 +539,10 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			}
 		}
 	}
+	if !sameCredentialOwner(existing, auth) {
+		auth.RejectedAccessToken = ""
+		auth.RejectedSIWCAccessToken = ""
+	}
 	auth.UpdatedAt = now
 	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {

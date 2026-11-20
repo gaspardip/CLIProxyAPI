@@ -279,29 +279,31 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 	shouldRefresh := manager.shouldRefresh(auth, now)
 	exec, _ := manager.executorLocked(executorKeyFromAuth(auth))
 	registrationEpoch := auth.RegistrationEpoch
-	manager.mu.RUnlock()
 
 	if !shouldSchedule {
 		l.remove(authID)
+		manager.mu.RUnlock()
 		return
 	}
 
 	if !shouldRefresh {
 		l.upsert(authID, next)
+		manager.mu.RUnlock()
 		return
 	}
 
 	if exec == nil {
 		l.upsert(authID, now.Add(l.interval))
+		manager.mu.RUnlock()
 		return
 	}
+	manager.mu.RUnlock()
 
 	job := manager.markRefreshPending(l, authID, registrationEpoch, now)
 	if job == nil {
 		manager.mu.RLock()
 		auth = manager.auths[authID]
 		next, shouldSchedule = manager.nextRefreshCheckAt(now, auth, l.interval)
-		manager.mu.RUnlock()
 		if shouldSchedule {
 			if !next.After(now) {
 				next = now.Add(l.interval)
@@ -310,6 +312,7 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 		} else {
 			l.remove(authID)
 		}
+		manager.mu.RUnlock()
 		return
 	}
 
@@ -337,13 +340,12 @@ func (l *authAutoRefreshLoop) applyDirty(now time.Time) {
 		l.manager.mu.RLock()
 		auth := l.manager.auths[authID]
 		next, ok := l.manager.nextRefreshCheckAt(now, auth, l.interval)
-		l.manager.mu.RUnlock()
-
 		if !ok {
 			l.remove(authID)
-			continue
+		} else {
+			l.upsert(authID, next)
 		}
-		l.upsert(authID, next)
+		l.manager.mu.RUnlock()
 	}
 }
 

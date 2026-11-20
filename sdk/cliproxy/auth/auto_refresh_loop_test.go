@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -587,5 +588,46 @@ func TestNextRefreshCheckAtIncludesSIWCWhenClassifiedAsAPIKey(t *testing.T) {
 	wantDue := siwcExp.Add(-CodexSIWCRefreshLead)
 	if !ok || !due.Equal(wantDue) {
 		t.Fatalf("nextRefreshCheckAt = (%v, %v), want (%v, true)", due, ok, wantDue)
+	}
+}
+
+func TestLateRefreshUnschedulePreservesReplacement(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	lead := 10 * time.Minute
+	setRefreshLeadFactory(t, "replacement-schedule", func() *time.Duration { return &lead })
+	for _, applied := range []bool{false, true} {
+		t.Run(fmt.Sprintf("schedule-applied=%t", applied), func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			loop := newAuthAutoRefreshLoop(m, time.Second, 1)
+			m.refreshLoop = loop
+			a, err := m.Register(ctx, &Auth{ID: "replacement", Provider: "replacement-schedule", Metadata: map[string]any{"email": "old@example.com", "expires_at": now.Add(time.Hour).Format(time.RFC3339)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			loop.applyDirty(now)
+			a.Metadata["email"] = "new@example.com"
+			a.Metadata["expires_at"] = now.Add(2 * time.Hour).Format(time.RFC3339)
+			if _, err := m.Update(ctx, a); err != nil {
+				t.Fatal(err)
+			}
+			if applied {
+				loop.applyDirty(now)
+			}
+			// The old terminal refresh resumes after the replacement was published.
+			m.queueRefreshUnschedule(a.ID)
+			loop.applyDirty(now)
+			if due := loop.popDue(now.Add(time.Hour)); len(due) != 0 {
+				t.Fatal("replacement used old schedule")
+			}
+			if due := loop.popDue(now.Add(2 * time.Hour)); len(due) != 1 || due[0] != a.ID {
+				t.Fatal("replacement lost its automatic refresh")
+			}
+			m.Remove(ctx, a.ID)
+			loop.applyDirty(now)
+			if due := loop.popDue(now.Add(3 * time.Hour)); len(due) != 0 {
+				t.Fatal("removed credential stayed scheduled")
+			}
+		})
 	}
 }
