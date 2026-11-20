@@ -321,27 +321,24 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		return nil, false, false, nil
 	}
 	if mode == updateModePrepare || mode == updateModeRefresh {
-		// The mutation gate and manager lock must protect ownership before any merge or publication.
-		if !sameCredentialOwner(base, existing) || !sameDispatchProvider(base, auth) {
+		// The mutation gate and manager lock make this a compare-and-swap on the revision base was read from.
+		if !sameCredentialOwner(base, existing) || !sameDispatchProvider(base, auth) || credentialAccountConflict(base, existing, auth) {
 			m.mu.Unlock()
 			return nil, false, false, errCredentialOwnershipChanged
 		}
-		if mode == updateModePrepare {
-			revisionChanged := existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing) || existing.AdoptedGrantHash != base.AdoptedGrantHash || AuthGrantFingerprint(existing) != AuthGrantFingerprint(base) || credentialAccountChanged(base, existing, false)
-			if revisionChanged && (CredentialsChanged(base, auth) || AuthGrantFingerprint(base) != AuthGrantFingerprint(auth) || credentialAccountChanged(base, auth, false)) {
+		if !sameRevision(base, existing) {
+			if mode == updateModePrepare {
 				m.mu.Unlock()
-				return nil, false, false, errCredentialOwnershipChanged
+				return nil, false, false, errCredentialRevisionChanged
 			}
-		}
-	}
-	// Do not let an in-flight refresh overwrite credentials committed after its snapshot.
-	if mode == updateModeRefresh && base != nil && (existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing)) {
-		if auth.CodexRefreshPatch == nil || !auth.CodexRefreshPatch.CanApplyTo(existing.Metadata) {
-			current := existing.Clone()
-			m.mu.Unlock()
-			// Discarded stale refresh: committed=false so callers do not
-			// run finishAuthUpdate for a state this call did not change.
-			return current, false, false, nil
+			// Do not let an in-flight refresh overwrite credentials committed after its snapshot.
+			if auth.CodexRefreshPatch == nil || !auth.CodexRefreshPatch.CanApplyTo(existing.Metadata) {
+				current := existing.Clone()
+				m.mu.Unlock()
+				// Discarded stale refresh: committed=false so callers do not
+				// run finishAuthUpdate for a state this call did not change.
+				return current, false, false, nil
+			}
 		}
 	}
 	if m.authEpochs == nil {
@@ -403,6 +400,8 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	}
 	cooldownStateChanged := false
 	now := time.Now()
+	// Cooldowns belong to the account that earned them; a replacement for another account starts clean.
+	sameOwner := sameCredentialOwner(existing, auth)
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if isFileSnapshot {
 			auth.ModelStates = cloneModelStates(existing.ModelStates)
@@ -414,7 +413,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		} else if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 			auth.ModelStates = cloneModelStates(existing.ModelStates)
 		}
-		if isFileSnapshot || (credChanged && mode == updateModeReplace && existing.Quota.Exceeded && existing.Quota.NextRecoverAt.After(now) && !auth.Quota.NextRecoverAt.After(now)) {
+		if sameOwner && (isFileSnapshot || (credChanged && mode == updateModeReplace && existing.Quota.Exceeded && existing.Quota.NextRecoverAt.After(now) && !auth.Quota.NextRecoverAt.After(now))) {
 			if (auth.Status == "" || auth.Status == StatusActive) && existing.Status != "" {
 				auth.Status = existing.Status
 			}
@@ -432,7 +431,10 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			auth.Quota.Signals = observation.Signals
 			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
 		}
-		if credChanged || mode == updateModeRefresh || !sameCredentialOwner(existing, auth) {
+		if !sameOwner {
+			cooldownStateChanged = clearCooldownStateForAuth(auth, now) || cooldownStateChanged
+		}
+		if credChanged || mode == updateModeRefresh || !sameOwner {
 			applyPreservedRejectedTokens(existing, auth, mode == updateModeRefresh)
 			applyPreservedRenewalState(existing, auth, mode, now)
 			if auth.RejectedAccessToken == "" || authAccessToken(auth) != auth.RejectedAccessToken {
@@ -508,7 +510,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		devinQuotaRestored := mode == updateModeRefresh && applyDevinQuotaRestoration(auth, existing, now)
 		if devinQuotaRestored {
 			cooldownStateChanged = true
-		} else if existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(now) {
+		} else if sameOwner && existing.Quota.Exceeded && existing.Quota.Reason == "credential_quota" && existing.Quota.NextRecoverAt.After(now) {
 			auth.Unavailable = existing.Unavailable
 			auth.NextRetryAfter = existing.NextRetryAfter
 			// Preserve cooldown fields; keep the newest observation snapshot.
@@ -889,23 +891,4 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	defer releaseFg()
 	_, err := store.Save(ctx, auth)
 	return err
-}
-
-// ignoreMissing allows profile discovery without treating it as an account replacement.
-func credentialAccountChanged(base, current *Auth, ignoreMissing bool) bool {
-	for _, key := range []string{"email", "account_id", "account_uuid", "organization_uuid"} {
-		for _, pair := range [][2]string{{authMetadataString(base, key), authMetadataString(current, key)}, {base.Attributes[key], current.Attributes[key]}} {
-			before, after := strings.TrimSpace(pair[0]), strings.TrimSpace(pair[1])
-			if ignoreMissing && (before == "" || after == "") {
-				continue
-			}
-			if key == "email" && strings.EqualFold(before, after) {
-				continue
-			}
-			if before != after {
-				return true
-			}
-		}
-	}
-	return false
 }

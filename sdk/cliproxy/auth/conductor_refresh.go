@@ -114,7 +114,7 @@ func (m *Manager) queueRefreshUnschedule(authID string, expected *Auth) {
 	}
 	// Recompute only if the credential changed since the terminal decision.
 	current := m.auths[authID]
-	if current != nil && (!sameCredentialOwner(expected, current) || expected.CredentialVersion != current.CredentialVersion) {
+	if current != nil && !sameRevision(expected, current) {
 		loop.queueReschedule(authID)
 	} else {
 		loop.remove(authID)
@@ -1341,14 +1341,12 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			shouldReschedule := false
 			shouldUnschedule := false
 			m.mu.Lock()
-			if !sameCredentialOwner(auth, m.auths[id]) {
+			current, errOwner := m.liveRevisionLocked(auth)
+			if errOwner != nil {
 				m.mu.Unlock()
-				return nil, errCredentialOwnershipChanged
+				return nil, errOwner
 			}
-			if current := m.auths[id]; current != nil &&
-				current.RegistrationEpoch == auth.RegistrationEpoch &&
-				current.CredentialVersion == auth.CredentialVersion &&
-				authHasUnchangedRejectedRefreshToken(current) {
+			if current != nil && authHasUnchangedRejectedRefreshToken(current) {
 				if exp, ok := current.AccessTokenExpirationTime(); ok && !exp.IsZero() && exp.After(checkNow) {
 					if !current.NextRefreshAfter.Equal(exp) {
 						current.NextRefreshAfter = exp
@@ -1379,14 +1377,12 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		}
 		// Access token has expired (or was rejected by a 401) while refresh grant remains terminally rejected.
 		m.mu.Lock()
-		if !sameCredentialOwner(auth, m.auths[id]) {
+		current, errOwner := m.liveRevisionLocked(auth)
+		if errOwner != nil {
 			m.mu.Unlock()
-			return nil, errCredentialOwnershipChanged
+			return nil, errOwner
 		}
-		if current := m.auths[id]; current != nil &&
-			current.RegistrationEpoch == auth.RegistrationEpoch &&
-			current.CredentialVersion == auth.CredentialVersion &&
-			authHasUnchangedRejectedRefreshToken(current) {
+		if current != nil && authHasUnchangedRejectedRefreshToken(current) {
 			wasTerminalUnauthorized := hasUnauthorizedAuthFailure(current)
 			current.Generation++
 			current.UpdatedAt = checkNow
@@ -1449,11 +1445,12 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if refreshCanceled {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
 		m.mu.Lock()
-		if !sameCredentialOwner(base, m.auths[id]) {
+		current, errOwner := m.liveRevisionLocked(base)
+		if errOwner != nil {
 			m.mu.Unlock()
-			return nil, errCredentialOwnershipChanged
+			return nil, errOwner
 		}
-		if current := m.auths[id]; current != nil {
+		if current != nil {
 			if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
 				current.NextRefreshAfter = now.Add(time.Second)
 			}
@@ -1492,15 +1489,12 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		isDisabled := false
 		shouldUnschedule := false
 		m.mu.Lock()
-		if !sameCredentialOwner(base, m.auths[id]) {
+		current, errOwner := m.liveRevisionLocked(base)
+		if errOwner != nil {
 			m.mu.Unlock()
-			return nil, errCredentialOwnershipChanged
+			return nil, errOwner
 		}
-		if current := m.auths[id]; current != nil {
-			if base != nil && (current.RegistrationEpoch != base.RegistrationEpoch || current.CredentialVersion != base.CredentialVersion || secretGrantChanged(base, current)) {
-				m.mu.Unlock()
-				return nil, err
-			}
+		if current != nil {
 			if hasUnauthorizedAuthFailure(current) && !forceRefresh {
 				m.mu.Unlock()
 				return nil, err

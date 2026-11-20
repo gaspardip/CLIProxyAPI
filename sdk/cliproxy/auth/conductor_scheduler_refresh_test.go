@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1052,8 +1053,9 @@ func TestManager_RefreshAuth_RestoresStatusFromErrorToActive(t *testing.T) {
 
 type testPrepareExecutor struct {
 	schedulerProviderTestExecutor
-	started chan struct{}
-	release chan struct{}
+	started     chan struct{}
+	startedOnce sync.Once
+	release     chan struct{}
 }
 
 func (e *testPrepareExecutor) ShouldPrepareRequestAuth(auth *Auth) bool {
@@ -1061,7 +1063,8 @@ func (e *testPrepareExecutor) ShouldPrepareRequestAuth(auth *Auth) bool {
 }
 
 func (e *testPrepareExecutor) PrepareRequestAuth(ctx context.Context, auth *Auth) (*Auth, error) {
-	close(e.started)
+	// A preparation that loses a revision race is redone on the live revision.
+	e.startedOnce.Do(func() { close(e.started) })
 	<-e.release
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)

@@ -576,6 +576,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	attempted := make(map[string]struct{})
 	var lastErr error
 	var upstreamErr error
+	revisionRetries := 0
+pick:
 	for {
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -620,7 +622,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
-			if errors.Is(errPrepare, errCredentialOwnershipChanged) {
+			if errors.Is(errPrepare, errCredentialRevisionChanged) {
 				return cliproxyexecutor.Response{}, errPrepare
 			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
@@ -678,6 +680,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
 			if errPolicy := m.validateDispatchAuth(execCtx, routeModel, execOpts, auth); errPolicy != nil {
+				if retryDispatchSelection(errPolicy, auth.ID, tried, attempted, &revisionRetries) {
+					continue pick
+				}
 				return cliproxyexecutor.Response{}, errPolicy
 			}
 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
@@ -701,6 +706,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
 					if errPolicy := m.validateDispatchAuth(execCtx, routeModel, execOpts, auth); errPolicy != nil {
+						if retryDispatchSelection(errPolicy, auth.ID, tried, attempted, &revisionRetries) {
+							continue pick
+						}
 						return cliproxyexecutor.Response{}, errPolicy
 					}
 					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
@@ -807,6 +815,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	attempted := make(map[string]struct{})
 	var lastErr error
 	var upstreamErr error
+	revisionRetries := 0
+pick:
 	for {
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
@@ -851,7 +861,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
-			if errors.Is(errPrepare, errCredentialOwnershipChanged) {
+			if errors.Is(errPrepare, errCredentialRevisionChanged) {
 				return cliproxyexecutor.Response{}, errPrepare
 			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
@@ -909,6 +919,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
 			if errPolicy := m.validateDispatchAuth(execCtx, routeModel, execOpts, auth); errPolicy != nil {
+				if retryDispatchSelection(errPolicy, auth.ID, tried, attempted, &revisionRetries) {
+					continue pick
+				}
 				return cliproxyexecutor.Response{}, errPolicy
 			}
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
@@ -932,6 +945,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
 					if errPolicy := m.validateDispatchAuth(execCtx, routeModel, execOpts, auth); errPolicy != nil {
+						if retryDispatchSelection(errPolicy, auth.ID, tried, attempted, &revisionRetries) {
+							continue pick
+						}
 						return cliproxyexecutor.Response{}, errPolicy
 					}
 					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
@@ -1049,6 +1065,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	var lastErr error
 	var upstreamErr error
 	var roundTiming homeRetryRoundTiming
+	revisionRetries := 0
 	for {
 		allowSameAuthRetry := homeMode && homeSameAuthRetryPending && lastHomeAuthID != "" && homeSameAuthRetries[lastHomeAuthID] == 0
 		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials && !allowSameAuthRetry {
@@ -1211,7 +1228,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		}
 		if errPrepare != nil {
-			if selection == nil && errors.Is(errPrepare, errCredentialOwnershipChanged) {
+			if selection == nil && errors.Is(errPrepare, errCredentialRevisionChanged) {
 				return nil, errPrepare
 			}
 			if selection != nil {
@@ -1304,6 +1321,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, execReq, execOpts, routeModel, streamExecutionModel, models, pooled, aliasResult, routing, !homeMode || selection != nil, selection != nil)
 		if errStream != nil {
+			if selection == nil && retryDispatchSelection(errStream, auth.ID, tried, attempted, &revisionRetries) {
+				continue
+			}
 			if hasUpstreamExecutionAttempt(errStream) {
 				upstreamErr = errStream
 			}
@@ -1692,51 +1712,63 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 	prepareMu.Lock()
 	defer prepareMu.Unlock()
 
-	target := auth.Clone()
-	m.mu.RLock()
-	current := m.auths[id]
-	if current != nil {
-		target = current.Clone()
-	}
-	m.mu.RUnlock()
-	if current == nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
-		return nil, fmt.Errorf("prepare meta auth: credential no longer registered")
-	}
+	// Each attempt prepares one live revision. A result for a revision that moved is redone, never merged across.
+	for attempt := 0; ; attempt++ {
+		target := auth.Clone()
+		m.mu.RLock()
+		current := m.auths[id]
+		if current != nil {
+			target = current.Clone()
+		}
+		m.mu.RUnlock()
+		if current == nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+			return nil, fmt.Errorf("prepare meta auth: credential no longer registered")
+		}
 
-	if !sameDispatchProvider(auth, target) {
-		return auth, errCredentialOwnershipChanged
-	}
-
-	if !preparer.ShouldPrepareRequestAuth(target) {
-		return target, nil
-	}
-
-	base := target.Clone()
-	updated, errPrepare := preparer.PrepareRequestAuth(ctx, base.Clone())
-	if errPrepare != nil {
-		return auth, errPrepare
-	}
-	if updated == nil {
-		return target, nil
-	}
-
-	if !sameDispatchProvider(auth, updated) {
-		return auth, errCredentialOwnershipChanged
-	}
-	saved, errUpdate := m.UpdatePreparedAuth(ctx, base, updated)
-	if errUpdate != nil {
-		return auth, errUpdate
-	}
-	if saved != nil {
-		if !sameDispatchProvider(auth, saved) {
+		if !sameDispatchProvider(auth, target) {
 			return auth, errCredentialOwnershipChanged
 		}
-		return saved, nil
+
+		if !preparer.ShouldPrepareRequestAuth(target) {
+			return target, nil
+		}
+
+		base := target.Clone()
+		updated, errPrepare := preparer.PrepareRequestAuth(ctx, base.Clone())
+		if errPrepare != nil {
+			return auth, errPrepare
+		}
+		if updated == nil {
+			return target, nil
+		}
+
+		if !sameDispatchProvider(auth, updated) {
+			return auth, errCredentialOwnershipChanged
+		}
+		saved, errUpdate := m.UpdatePreparedAuth(ctx, base, updated)
+		if errors.Is(errUpdate, errCredentialRevisionChanged) && !errors.Is(errUpdate, errCredentialOwnershipChanged) {
+			// Credentials minted for an older grant are stale; metadata is rediscovered on the live grant.
+			if CredentialsChanged(base, updated) {
+				return auth, errCredentialOwnershipChanged
+			}
+			if attempt < maxDispatchRevisionRetries {
+				continue
+			}
+		}
+		if errUpdate != nil {
+			return auth, errUpdate
+		}
+		if saved != nil {
+			if !sameDispatchProvider(auth, saved) {
+				return auth, errCredentialOwnershipChanged
+			}
+			return saved, nil
+		}
+		if strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
+			return nil, fmt.Errorf("prepare meta auth: credential removed during mint")
+		}
+		return target, nil
 	}
-	if strings.EqualFold(strings.TrimSpace(auth.Provider), "meta") {
-		return nil, fmt.Errorf("prepare meta auth: credential removed during mint")
-	}
-	return target, nil
 }
 
 func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
