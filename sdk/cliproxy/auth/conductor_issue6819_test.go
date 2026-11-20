@@ -192,7 +192,9 @@ func TestIssue6819_OuterRefreshDoesNotClearSIWCRejectedAccessToken(t *testing.T)
 		t.Fatalf("Register error: %v", errReg)
 	}
 
-	m.markRejectedAccessToken(auth.ID, siwcToken)
+	if err := m.markRejectedAccessToken(auth.ID, siwcToken, nil); err != nil {
+		t.Fatal(err)
+	}
 	beforeRefresh, _ := m.GetByID(auth.ID)
 	if beforeRefresh.RejectedAccessToken != siwcToken {
 		t.Fatalf("precondition RejectedAccessToken = %q, want %q", beforeRefresh.RejectedAccessToken, siwcToken)
@@ -263,7 +265,9 @@ func TestIssue6819_OuterRefreshDoesNotClearSIWCRejectedAccessToken(t *testing.T)
 	if _, errSetLive := m.Update(context.Background(), liveBeforeStaleMerge); errSetLive != nil {
 		t.Fatalf("Update liveBeforeStaleMerge error: %v", errSetLive)
 	}
-	m.markRejectedAccessToken(auth.ID, siwcToken)
+	if err := m.markRejectedAccessToken(auth.ID, siwcToken, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	staleUpdated := staleBase.Clone()
 	staleUpdated.Metadata["access_token"] = "outer-token-4"
@@ -475,7 +479,9 @@ func TestIssue6819_InStream401RecordedAfterConcurrentOuterRefreshAndAcrossUseSIW
 	}
 
 	// Outer token hits 401 while use_siwc=false, then outer refreshes to outer-token-3.
-	m.markRejectedAccessToken(auth.ID, "outer-token-2")
+	if err := m.markRejectedAccessToken(auth.ID, "outer-token-2", nil); err != nil {
+		t.Fatal(err)
+	}
 	exec.nextOuter = "outer-token-3"
 	if _, errOuterRef2 := m.ForceRefreshAuth(context.Background(), auth.ID); errOuterRef2 != nil {
 		t.Fatalf("ForceRefreshAuth (outer recovery) error: %v", errOuterRef2)

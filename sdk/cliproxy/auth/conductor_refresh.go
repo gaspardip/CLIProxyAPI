@@ -1125,37 +1125,46 @@ func (m *Manager) RefreshHomeSelectionAfterUnauthorized(ctx context.Context, sel
 
 // tryRefreshAfterUnauthorized refreshes local OAuth credentials once after a
 // 401 so the current auth can be retried before fallback/suspend.
-func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool, clientHeaders ...http.Header) (*Auth, bool) {
+// Ownership conflicts abort bookkeeping; ordinary refresh failures retain the original 401.
+func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, execErr error, alreadyTried bool, clientHeaders ...http.Header) (*Auth, bool, error) {
 	if m == nil || auth == nil || execErr == nil {
-		return auth, false
+		return auth, false, nil
 	}
 	// Request-scoped failures describe this request, not stale credentials.
 	// Refreshing would turn a direct error response into an implicit retry.
 	if isRequestScopedError(execErr) || !isUnauthorizedError(execErr) {
-		return auth, false
+		return auth, false, nil
 	}
 	// A 401 matched by a configured request-scoped rule is the rule's to handle: no rejection, no refresh.
 	if _, ruleMatched := matchRequestScopedErrorAction(auth, execErr, m.runtimeConfigSnapshot()); ruleMatched {
-		return auth, false
+		return auth, false, nil
 	}
+	ctx = context.WithValue(ctx, dispatchProviderContextKey{}, auth.Clone())
 	failedToken := authAccessTokenForRequest(ctx, auth, clientHeaders...)
 	if failedToken != "" {
-		m.markRejectedAccessToken(auth.ID, failedToken)
+		if err := m.markRejectedAccessToken(auth.ID, failedToken, auth); err != nil {
+			return auth, false, err
+		}
 	}
 	if alreadyTried || !authHasRefreshCredential(auth) || hasUnauthorizedAuthFailure(auth) {
-		return auth, false
+		return auth, false, nil
 	}
 	log.Debugf("unauthorized response for %s (%s), refreshing credentials before fallback", auth.Provider, auth.ID)
-	ctx = context.WithValue(ctx, dispatchProviderContextKey{}, auth.Clone())
 	refreshed, errRefresh := m.refreshAuthForRequestAtEpoch(ctx, auth.ID, failedToken, auth.RegistrationEpoch)
-	if errRefresh != nil || !sameDispatchProvider(auth, refreshed) {
+	if errors.Is(errRefresh, errCredentialOwnershipChanged) {
+		return auth, false, errRefresh
+	}
+	if errRefresh != nil {
 		log.Debugf("credential refresh before fallback failed for %s (%s): %v", auth.Provider, auth.ID, errRefresh)
-		return auth, false
+		return auth, false, nil
+	}
+	if !sameDispatchProvider(auth, refreshed) {
+		return auth, false, errCredentialOwnershipChanged
 	}
 	if failedToken != "" && authAccessTokenForRequest(ctx, refreshed, clientHeaders...) == failedToken && (refreshed.RejectedAccessToken == failedToken || refreshed.RejectedSIWCAccessToken == failedToken) {
-		return auth, false
+		return auth, false, nil
 	}
-	return refreshed, true
+	return refreshed, true, nil
 }
 
 func invalidGrantBackoffDuration(failures int) time.Duration {
@@ -1211,14 +1220,19 @@ func isForceRefreshContext(ctx context.Context) bool {
 	return IsForceRefreshContext(ctx)
 }
 
-func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
+func (m *Manager) markRejectedAccessToken(id, failedAccessToken string, expected *Auth) error {
 	if m == nil || id == "" || failedAccessToken == "" {
-		return
+		return nil
 	}
 	releaseMutation := m.lockAuthMutation(id)
 	defer releaseMutation()
 	m.mu.Lock()
-	if current := m.auths[id]; current != nil && recordRejectedTokenOnAuth(current, failedAccessToken) {
+	current := m.auths[id]
+	if expected != nil && (!sameDispatchProvider(expected, current) || expected.RegistrationEpoch != current.RegistrationEpoch || credentialAccountChanged(expected, current, true)) {
+		m.mu.Unlock()
+		return errCredentialOwnershipChanged
+	}
+	if current != nil && recordRejectedTokenOnAuth(current, failedAccessToken) {
 		current.Generation++
 		current.UpdatedAt = time.Now()
 		m.auths[id] = current
@@ -1227,6 +1241,7 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 		}
 	}
 	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAccessToken string, registrationEpoch uint64) (*Auth, error) {
@@ -1246,7 +1261,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		return nil, errors.New("auth id is empty")
 	}
 	if failedAccessToken != "" {
-		m.markRejectedAccessToken(id, failedAccessToken)
+		selected, _ := ctx.Value(dispatchProviderContextKey{}).(*Auth)
+		if err := m.markRejectedAccessToken(id, failedAccessToken, selected); err != nil {
+			return nil, err
+		}
 	}
 
 	lockValue, _ := m.refreshLocks.LoadOrStore(id, &authRefreshLock{})
@@ -1268,11 +1286,11 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		exec, _ = m.executorLocked(executorKeyFromAuth(auth))
 	}
 	m.mu.RUnlock()
+	if selected, ok := ctx.Value(dispatchProviderContextKey{}).(*Auth); ok && (!sameDispatchProvider(selected, auth) || selected.RegistrationEpoch != auth.RegistrationEpoch || credentialAccountChanged(selected, auth, true)) {
+		return nil, errCredentialOwnershipChanged
+	}
 	if auth == nil || exec == nil {
 		return nil, errors.New("auth or executor not found")
-	}
-	if selected, ok := ctx.Value(dispatchProviderContextKey{}).(*Auth); ok && !sameDispatchProvider(selected, auth) {
-		return nil, errors.New("credential provider changed before refresh")
 	}
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		if resolver, okResolver := store.(interface {
@@ -1288,7 +1306,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		}
 	}
 	if registrationEpoch != 0 && auth.RegistrationEpoch != registrationEpoch {
-		return nil, errors.New("auth registration changed before refresh")
+		return nil, errCredentialOwnershipChanged
 	}
 	if hasDisabledInvalidGrantFailure(auth) && !forceRefresh {
 		return nil, errors.New("auth is disabled with invalid grant")

@@ -2,9 +2,12 @@ package auth
 
 import (
 	"context"
+	"errors"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
+
+var errCredentialOwnershipChanged = errors.New("credential ownership changed")
 
 // Preparation and 401 recovery may replace the selected credential. Reauthorize
 // the actual dispatch candidate against the policy's full pool, without rebinding affinity.

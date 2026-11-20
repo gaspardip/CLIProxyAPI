@@ -620,6 +620,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			if errors.Is(errPrepare, errCredentialOwnershipChanged) {
+				return cliproxyexecutor.Response{}, errPrepare
+			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
@@ -687,7 +690,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				refreshCtx := newUpstreamAttemptContext(execCtx)
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized, execOpts.Headers); okRefresh {
+				if refreshed, okRefresh, errOwnership := m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized, execOpts.Headers); errOwnership != nil {
+					return cliproxyexecutor.Response{}, errOwnership
+				} else if okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
 					execCtx = newUpstreamAttemptContext(execCtx)
@@ -844,6 +849,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		var errPrepare error
 		auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		if errPrepare != nil {
+			if errors.Is(errPrepare, errCredentialOwnershipChanged) {
+				return cliproxyexecutor.Response{}, errPrepare
+			}
 			if errCancel := claudeOAuthRequestCancellation(execCtx, auth, errPrepare); errCancel != nil {
 				return cliproxyexecutor.Response{}, errCancel
 			}
@@ -911,7 +919,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				refreshCtx := newUpstreamAttemptContext(execCtx)
-				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized, execOpts.Headers); okRefresh {
+				if refreshed, okRefresh, errOwnership := m.tryRefreshAfterUnauthorized(refreshCtx, auth, errExec, didRefreshOnUnauthorized, execOpts.Headers); errOwnership != nil {
+					return cliproxyexecutor.Response{}, errOwnership
+				} else if okRefresh {
 					auth = refreshed
 					didRefreshOnUnauthorized = true
 					execCtx = newUpstreamAttemptContext(execCtx)
@@ -1197,6 +1207,9 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			auth, errPrepare = m.prepareRequestAuth(execCtx, executor, auth)
 		}
 		if errPrepare != nil {
+			if selection == nil && errors.Is(errPrepare, errCredentialOwnershipChanged) {
+				return nil, errPrepare
+			}
 			if selection != nil {
 				excludeAuth := shouldExcludeHomeAuthAfterStreamError(execCtx, auth, errPrepare)
 				if homeSameAuthRetries[auth.ID] > 0 {
@@ -1686,7 +1699,7 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 	}
 
 	if !sameDispatchProvider(auth, target) {
-		return auth, errors.New("credential provider changed before preparation")
+		return auth, errCredentialOwnershipChanged
 	}
 
 	if !preparer.ShouldPrepareRequestAuth(target) {
@@ -1703,7 +1716,7 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 	}
 
 	if !sameDispatchProvider(auth, updated) {
-		return auth, errors.New("credential provider changed during preparation")
+		return auth, errCredentialOwnershipChanged
 	}
 	saved, errUpdate := m.UpdatePreparedAuth(ctx, base, updated)
 	if errUpdate != nil {
@@ -1711,7 +1724,7 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 	}
 	if saved != nil {
 		if !sameDispatchProvider(auth, saved) {
-			return auth, errors.New("credential provider changed after preparation")
+			return auth, errCredentialOwnershipChanged
 		}
 		return saved, nil
 	}

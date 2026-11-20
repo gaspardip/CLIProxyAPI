@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -325,17 +324,17 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		// The mutation gate and manager lock must protect ownership before any merge or publication.
 		if base == nil || !sameDispatchProvider(base, existing) || !sameDispatchProvider(base, auth) || credentialAccountChanged(base, existing, true) {
 			m.mu.Unlock()
-			return nil, false, false, errors.New("credential ownership changed before update")
+			return nil, false, false, errCredentialOwnershipChanged
 		}
 		if existing.RegistrationEpoch != base.RegistrationEpoch {
 			m.mu.Unlock()
-			return nil, false, false, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
+			return nil, false, false, errCredentialOwnershipChanged
 		}
 		if mode == updateModePrepare {
 			revisionChanged := existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing) || existing.AdoptedGrantHash != base.AdoptedGrantHash || AuthGrantFingerprint(existing) != AuthGrantFingerprint(base) || credentialAccountChanged(base, existing, false)
 			if revisionChanged && (CredentialsChanged(base, auth) || AuthGrantFingerprint(base) != AuthGrantFingerprint(auth) || credentialAccountChanged(base, auth, false)) {
 				m.mu.Unlock()
-				return nil, false, false, errors.New("credential revision changed before preparation update")
+				return nil, false, false, errCredentialOwnershipChanged
 			}
 		}
 	}

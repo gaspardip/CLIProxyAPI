@@ -241,7 +241,9 @@ func TestManager_Issue6415_MarkRejectedAccessToken_AdvancesGeneration(t *testing
 	}
 	initialGen := initialPrimary.Generation
 
-	m.markRejectedAccessToken(primary.ID, authAccessToken(initialPrimary))
+	if err := m.markRejectedAccessToken(primary.ID, authAccessToken(initialPrimary), nil); err != nil {
+		t.Fatal(err)
+	}
 
 	afterPrimary, ok := m.GetByID(primary.ID)
 	if !ok || afterPrimary == nil {
@@ -262,7 +264,9 @@ func TestManager_Issue6415_UpdateWithoutCredentialChange_PreservesRejectedAccess
 	m, _, primary, _, _ := newUnauthorizedRefreshFixture(t, false)
 
 	token := authAccessToken(primary)
-	m.markRejectedAccessToken(primary.ID, token)
+	if err := m.markRejectedAccessToken(primary.ID, token, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	// Simulate config reload or metadata update (e.g. note or weight change, but same credentials).
 	reloadAuth := primary.Clone()
@@ -293,7 +297,9 @@ func TestManager_Issue6415_RefreshSuccessWithUnchangedToken_ClearsRejectedAccess
 	m, executor, primary, _, model := newUnauthorizedRefreshFixture(t, false)
 
 	token := authAccessToken(primary)
-	m.markRejectedAccessToken(primary.ID, token)
+	if err := m.markRejectedAccessToken(primary.ID, token, nil); err != nil {
+		t.Fatal(err)
+	}
 
 	// Executor Refresh returns the same token string (e.g. session refreshed without rotating key).
 	executor.mu.Lock()
