@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -179,7 +180,7 @@ const (
 )
 
 // UpdatePreparedAuth atomically merges request preparation results into the latest runtime auth
-// under the manager lock, preserving concurrent modifications without modifying refresh lifecycle fields.
+// under the manager lock, rejecting changed ownership and stale credential writes.
 func (m *Manager) UpdatePreparedAuth(ctx context.Context, base, updated *Auth) (*Auth, error) {
 	return m.updateInternal(ctx, base, updated, updateModePrepare)
 }
@@ -291,7 +292,9 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	if auth == nil || auth.ID == "" {
 		return nil, false, false, nil
 	}
-	NormalizeCredentialMetadata(auth.Metadata)
+	if mode == updateModeReplace {
+		NormalizeCredentialMetadata(auth.Metadata)
+	}
 	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 		return nil, false, false, fmt.Errorf("update auth: %w", errWeight)
 	}
@@ -318,15 +321,23 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		m.mu.Unlock()
 		return nil, false, false, nil
 	}
-	if m.authEpochs == nil {
-		m.authEpochs = make(map[string]uint64)
-	}
-	if existing.RegistrationEpoch > m.authEpochs[auth.ID] {
-		m.authEpochs[auth.ID] = existing.RegistrationEpoch
-	}
-	if (mode == updateModeRefresh || mode == updateModePrepare) && base != nil && existing.RegistrationEpoch != base.RegistrationEpoch {
-		m.mu.Unlock()
-		return nil, false, false, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
+	if mode == updateModePrepare || mode == updateModeRefresh {
+		// The mutation gate and manager lock must protect ownership before any merge or publication.
+		if base == nil || !sameDispatchProvider(base, existing) || !sameDispatchProvider(base, auth) || credentialAccountChanged(base, existing, true) {
+			m.mu.Unlock()
+			return nil, false, false, errors.New("credential ownership changed before update")
+		}
+		if existing.RegistrationEpoch != base.RegistrationEpoch {
+			m.mu.Unlock()
+			return nil, false, false, fmt.Errorf("update auth %s: stale registration epoch %d != %d", auth.ID, base.RegistrationEpoch, existing.RegistrationEpoch)
+		}
+		if mode == updateModePrepare {
+			revisionChanged := existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing) || existing.AdoptedGrantHash != base.AdoptedGrantHash || AuthGrantFingerprint(existing) != AuthGrantFingerprint(base) || credentialAccountChanged(base, existing, false)
+			if revisionChanged && (CredentialsChanged(base, auth) || AuthGrantFingerprint(base) != AuthGrantFingerprint(auth) || credentialAccountChanged(base, auth, false)) {
+				m.mu.Unlock()
+				return nil, false, false, errors.New("credential revision changed before preparation update")
+			}
+		}
 	}
 	// Do not let an in-flight refresh overwrite credentials committed after its snapshot.
 	if mode == updateModeRefresh && base != nil && (existing.CredentialVersion != base.CredentialVersion || CredentialsChanged(base, existing)) {
@@ -338,6 +349,13 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			return current, false, false, nil
 		}
 	}
+	if m.authEpochs == nil {
+		m.authEpochs = make(map[string]uint64)
+	}
+	if existing.RegistrationEpoch > m.authEpochs[auth.ID] {
+		m.authEpochs[auth.ID] = existing.RegistrationEpoch
+	}
+	NormalizeCredentialMetadata(auth.Metadata)
 	if mode == updateModeRefresh {
 		merged := MergeRefreshedAuth(base, existing, auth)
 		if merged != nil {
@@ -873,4 +891,23 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	defer releaseFg()
 	_, err := store.Save(ctx, auth)
 	return err
+}
+
+// ignoreMissing allows profile discovery without treating it as an account replacement.
+func credentialAccountChanged(base, current *Auth, ignoreMissing bool) bool {
+	for _, key := range []string{"email", "account_id", "account_uuid", "organization_uuid"} {
+		for _, pair := range [][2]string{{authMetadataString(base, key), authMetadataString(current, key)}, {base.Attributes[key], current.Attributes[key]}} {
+			before, after := strings.TrimSpace(pair[0]), strings.TrimSpace(pair[1])
+			if ignoreMissing && (before == "" || after == "") {
+				continue
+			}
+			if key == "email" && strings.EqualFold(before, after) {
+				continue
+			}
+			if before != after {
+				return true
+			}
+		}
+	}
+	return false
 }

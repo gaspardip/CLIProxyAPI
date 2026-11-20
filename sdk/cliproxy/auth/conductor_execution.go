@@ -1707,7 +1707,7 @@ func (m *Manager) PrepareRequestAuth(ctx context.Context, preparer RequestAuthPr
 	}
 	saved, errUpdate := m.UpdatePreparedAuth(ctx, base, updated)
 	if errUpdate != nil {
-		return nil, errUpdate
+		return auth, errUpdate
 	}
 	if saved != nil {
 		if !sameDispatchProvider(auth, saved) {
