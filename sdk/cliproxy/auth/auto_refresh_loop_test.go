@@ -639,17 +639,22 @@ func TestLateRefreshUnschedulePreservesReplacement(t *testing.T) {
 
 func TestTerminalUnknownRefreshStaysUnscheduled(t *testing.T) {
 	ctx := context.Background()
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	defer stopWorker()
 	m := NewManager(nil, nil, nil)
 	loop := newAuthAutoRefreshLoop(m, time.Second, 1)
 	m.refreshLoop = loop
-	e := &unauthorizedRefreshExecutor{id: "codex", refreshErr: &codex.RefreshOutcomeUnknownError{Stage: "transport"}}
+	e := &unauthorizedRefreshExecutor{id: "codex", onRefresh: stopWorker, refreshErr: &codex.RefreshOutcomeUnknownError{Stage: "transport"}}
 	m.RegisterExecutor(e)
 	a, err := m.Register(ctx, &Auth{ID: t.Name(), Provider: "codex", Metadata: map[string]any{"access_token": "expired", "refresh_token": "fixture-refresh", "expired": time.Now().Add(-time.Hour).Format(time.RFC3339)}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.ForceRefreshAuth(ctx, a.ID); !codex.IsRefreshOutcomeUnknown(err) {
-		t.Fatalf("unexpected refresh outcome: %v", err)
+	loop.handleDueAuth(ctx, time.Now(), a.ID)
+	loop.worker(workerCtx)
+	current, _ := m.GetByID(a.ID)
+	if e.RefreshCalls() != 1 || current.LastError == nil || current.LastError.Code != "refresh_outcome_unknown" {
+		t.Fatal("worker did not record terminal unknown refresh")
 	}
 	loop.applyDirty(time.Now())
 	if due := loop.popDue(time.Now().Add(time.Hour)); len(due) != 0 {

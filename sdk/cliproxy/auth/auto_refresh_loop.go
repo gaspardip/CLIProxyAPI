@@ -439,7 +439,7 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 			}
 			return time.Time{}, false
 		}
-		if auth.Disabled || auth.Status == StatusDisabled {
+		if auth.Disabled || auth.Status == StatusDisabled || (auth.RequiresSignIn && auth.LastError != nil && auth.LastError.Code == "refresh_outcome_unknown") {
 			return time.Time{}, false
 		}
 		return now, true

@@ -251,3 +251,40 @@ func TestReplacementDispatchesAfterOldOwnerUnauthorized(t *testing.T) {
 		}
 	}
 }
+
+func TestReplacementRecoveryDoesNotMutatePublishedOwnerDuringSave(t *testing.T) {
+	ctx := context.Background()
+	store := &ownershipSaveStore{}
+	m := NewManager(store, nil, nil)
+	a, err := m.Register(ctx, &Auth{ID: "fixture", Provider: "antigravity", Metadata: map[string]any{"email": "old@example.com", "access_token": "shared", "refresh_token": "shared-refresh"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.MarkResult(ctx, Result{AuthID: a.ID, Provider: a.Provider, Model: "fixture-model", AccessToken: "shared", Error: &Error{HTTPStatus: 401, Message: "fixture unauthorized"}})
+	before, _ := m.GetByID(a.ID)
+	if !before.ModelStates["fixture-model"].Unavailable {
+		t.Fatal("old cooldown missing")
+	}
+	replacement := before.Clone()
+	replacement.Metadata["email"] = "new@example.com"
+	replacement.ModelStates = nil
+	entered, release := make(chan struct{}), make(chan struct{})
+	store.beforeSave = func() { close(entered); <-release }
+	done := make(chan error, 1)
+	go func() { _, err := m.Update(ctx, replacement); done <- err }()
+	<-entered
+	during, _ := m.GetByID(a.ID)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, during) {
+		t.Error("replacement recovery mutated published old owner before save completed")
+	}
+	current, _ := m.GetByID(a.ID)
+	for _, saved := range []*Auth{current, store.lastAuth()} {
+		if authMetadataString(saved, "email") != "new@example.com" || saved.ModelStates["fixture-model"].Unavailable {
+			t.Error("replacement cooldown was not recovered in memory and storage")
+		}
+	}
+}

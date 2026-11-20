@@ -405,14 +405,14 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	now := time.Now()
 	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 		if isFileSnapshot {
-			auth.ModelStates = existing.ModelStates
+			auth.ModelStates = cloneModelStates(existing.ModelStates)
 			auth.LastRefreshedAt = existing.LastRefreshedAt
 			if !credChanged {
 				auth.NextRefreshAfter = existing.NextRefreshAfter
 				auth.RefreshFailures = existing.RefreshFailures
 			}
 		} else if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-			auth.ModelStates = existing.ModelStates
+			auth.ModelStates = cloneModelStates(existing.ModelStates)
 		}
 		if isFileSnapshot || (credChanged && mode == updateModeReplace && existing.Quota.Exceeded && existing.Quota.NextRecoverAt.After(now) && !auth.Quota.NextRecoverAt.After(now)) {
 			if (auth.Status == "" || auth.Status == StatusActive) && existing.Status != "" {
