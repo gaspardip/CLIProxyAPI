@@ -201,3 +201,49 @@ func TestReplacementClearsBothAccessTokenRejections(t *testing.T) {
 		})
 	}
 }
+
+func TestReplacementDispatchesAfterOldOwnerUnauthorized(t *testing.T) {
+	for _, mode := range []string{"execute", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			m := NewManager(nil, nil, nil)
+			e := &ownershipConflictExecutor{dispatchPolicyExecutor: dispatchPolicyExecutor{boundary: "prepare"}}
+			m.RegisterExecutor(e)
+			a, err := m.Register(ctx, &Auth{ID: t.Name(), Provider: "antigravity", Metadata: map[string]any{"email": "old@example.com", "access_token": "shared", "refresh_token": "old-refresh"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry.GetGlobalRegistry().RegisterClient(a.ID, a.Provider, []*registry.ModelInfo{{ID: "fixture-model"}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
+			m.MarkResult(ctx, Result{AuthID: a.ID, Provider: a.Provider, Model: "fixture-model", AccessToken: "shared", Error: &Error{HTTPStatus: 401, Message: "fixture unauthorized"}})
+			a, _ = m.GetByID(a.ID)
+			if a.RejectedAccessToken == "" || !a.ModelStates["fixture-model"].Unavailable {
+				t.Fatal("old owner's unauthorized result was not recorded")
+			}
+			a.Metadata["email"] = "new@example.com"
+			a.Metadata["refresh_token"] = "new-refresh"
+			if _, err := m.Update(ctx, a); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "execute" {
+				_, err = m.Execute(ctx, []string{a.Provider}, exec.Request{Model: "fixture-model"}, exec.Options{})
+			} else {
+				var response *exec.StreamResult
+				response, err = m.ExecuteStream(ctx, []string{a.Provider}, exec.Request{Model: "fixture-model"}, exec.Options{})
+				if err == nil {
+					for chunk := range response.Chunks {
+						if chunk.Err != nil {
+							err = chunk.Err
+						}
+					}
+				}
+			}
+			if err != nil {
+				t.Fatalf("replacement could not dispatch: %v", err)
+			}
+			if len(e.calls) != 1 || authMetadataString(e.calls[0], "email") != "new@example.com" {
+				t.Fatal("replacement did not reach executor")
+			}
+		})
+	}
+}

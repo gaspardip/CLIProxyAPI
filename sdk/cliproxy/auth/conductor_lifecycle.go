@@ -539,10 +539,6 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			}
 		}
 	}
-	if !sameCredentialOwner(existing, auth) {
-		auth.RejectedAccessToken = ""
-		auth.RejectedSIWCAccessToken = ""
-	}
 	auth.UpdatedAt = now
 	cooldownStateChanged = normalizeModelStates(auth) || cooldownStateChanged
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {
@@ -716,7 +712,7 @@ func (m *Manager) RemoveIf(ctx context.Context, id string, predicate func(*Auth)
 		m.scheduler.RecordRemovalTombstone(id, tombstoneEpoch)
 	}
 	m.structuralEpoch.Add(1)
-	m.queueRefreshUnschedule(id)
+	m.queueRefreshUnschedule(id, nil)
 	m.invalidateSessionAffinity(id)
 
 	if provider != "" {

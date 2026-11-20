@@ -596,8 +596,8 @@ func TestLateRefreshUnschedulePreservesReplacement(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	lead := 10 * time.Minute
 	setRefreshLeadFactory(t, "replacement-schedule", func() *time.Duration { return &lead })
-	for _, applied := range []bool{false, true} {
-		t.Run(fmt.Sprintf("schedule-applied=%t", applied), func(t *testing.T) {
+	for _, tc := range []struct{ applied, renewal bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("schedule-applied=%t/renewal=%t", tc.applied, tc.renewal), func(t *testing.T) {
 			m := NewManager(nil, nil, nil)
 			loop := newAuthAutoRefreshLoop(m, time.Second, 1)
 			m.refreshLoop = loop
@@ -606,16 +606,21 @@ func TestLateRefreshUnschedulePreservesReplacement(t *testing.T) {
 				t.Fatal(err)
 			}
 			loop.applyDirty(now)
-			a.Metadata["email"] = "new@example.com"
+			expected := a.Clone()
+			if tc.renewal {
+				a.Metadata["access_token"] = "renewed"
+			} else {
+				a.Metadata["email"] = "new@example.com"
+			}
 			a.Metadata["expires_at"] = now.Add(2 * time.Hour).Format(time.RFC3339)
 			if _, err := m.Update(ctx, a); err != nil {
 				t.Fatal(err)
 			}
-			if applied {
+			if tc.applied {
 				loop.applyDirty(now)
 			}
 			// The old terminal refresh resumes after the replacement was published.
-			m.queueRefreshUnschedule(a.ID)
+			m.queueRefreshUnschedule(a.ID, expected)
 			loop.applyDirty(now)
 			if due := loop.popDue(now.Add(time.Hour)); len(due) != 0 {
 				t.Fatal("replacement used old schedule")
@@ -629,5 +634,33 @@ func TestLateRefreshUnschedulePreservesReplacement(t *testing.T) {
 				t.Fatal("removed credential stayed scheduled")
 			}
 		})
+	}
+}
+
+func TestTerminalUnknownRefreshStaysUnscheduled(t *testing.T) {
+	ctx := context.Background()
+	m := NewManager(nil, nil, nil)
+	loop := newAuthAutoRefreshLoop(m, time.Second, 1)
+	m.refreshLoop = loop
+	e := &unauthorizedRefreshExecutor{id: "codex", refreshErr: &codex.RefreshOutcomeUnknownError{Stage: "transport"}}
+	m.RegisterExecutor(e)
+	a, err := m.Register(ctx, &Auth{ID: t.Name(), Provider: "codex", Metadata: map[string]any{"access_token": "expired", "refresh_token": "fixture-refresh", "expired": time.Now().Add(-time.Hour).Format(time.RFC3339)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.ForceRefreshAuth(ctx, a.ID); !codex.IsRefreshOutcomeUnknown(err) {
+		t.Fatalf("unexpected refresh outcome: %v", err)
+	}
+	loop.applyDirty(time.Now())
+	if due := loop.popDue(time.Now().Add(time.Hour)); len(due) != 0 {
+		t.Fatal("terminal refresh requeued without a new credential")
+	}
+	m.refreshAuth(ctx, a.ID)
+	loop.applyDirty(time.Now())
+	if due := loop.popDue(time.Now().Add(time.Hour)); len(due) != 0 {
+		t.Fatal("cached terminal refresh requeued itself")
+	}
+	if e.RefreshCalls() != 1 {
+		t.Fatal("terminal grant submitted again")
 	}
 }

@@ -102,7 +102,7 @@ func (m *Manager) queueRefreshReschedule(authID string) {
 	loop.queueReschedule(authID)
 }
 
-func (m *Manager) queueRefreshUnschedule(authID string) {
+func (m *Manager) queueRefreshUnschedule(authID string, expected *Auth) {
 	if m == nil || authID == "" {
 		return
 	}
@@ -112,8 +112,9 @@ func (m *Manager) queueRefreshUnschedule(authID string) {
 	if loop == nil {
 		return
 	}
-	// A late terminal result must recompute the replacement's schedule.
-	if m.auths[authID] != nil {
+	// Recompute only if the credential changed since the terminal decision.
+	current := m.auths[authID]
+	if current != nil && (!sameCredentialOwner(expected, current) || expected.CredentialVersion != current.CredentialVersion) {
 		loop.queueReschedule(authID)
 	} else {
 		loop.remove(authID)
@@ -852,6 +853,11 @@ func applyPreservedRejectedTokens(existing, updated *Auth, isRefresh bool) {
 	if updated == nil {
 		return
 	}
+	if !sameCredentialOwner(existing, updated) {
+		updated.RejectedAccessToken = ""
+		updated.RejectedSIWCAccessToken = ""
+		return
+	}
 	if rejectedSIWC, ok := shouldPreserveRejectedSIWCAccessToken(existing, updated); ok {
 		updated.RejectedSIWCAccessToken = rejectedSIWC
 	} else {
@@ -1361,7 +1367,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			if shouldReschedule {
 				m.queueRefreshReschedule(id)
 			} else if shouldUnschedule {
-				m.queueRefreshUnschedule(id)
+				m.queueRefreshUnschedule(id, auth)
 			}
 			if auth.RefreshError != nil {
 				return nil, auth.RefreshError
@@ -1412,7 +1418,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			}
 		}
 		m.mu.Unlock()
-		m.queueRefreshUnschedule(id)
+		m.queueRefreshUnschedule(id, auth)
 		if auth.RefreshError != nil {
 			return nil, auth.RefreshError
 		}
@@ -1524,7 +1530,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 					m.scheduler.upsertAuth(current.Clone())
 				}
 				m.mu.Unlock()
-				m.queueRefreshUnschedule(id)
+				m.queueRefreshUnschedule(id, auth)
 				return nil, err
 			}
 			current.Generation++
@@ -1687,7 +1693,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		if shouldReschedule {
 			m.queueRefreshReschedule(id)
 		} else if shouldUnschedule {
-			m.queueRefreshUnschedule(id)
+			m.queueRefreshUnschedule(id, auth)
 		}
 		return nil, err
 	}
