@@ -44,16 +44,23 @@ func (m *Manager) validateDispatchAuth(ctx context.Context, model string, opts c
 			}
 		}
 		if !authorized {
+			// A policy may deny a snapshot only because it was superseded; selection then retries on the live revision.
+			if !m.isLiveRevision(account) {
+				return errDispatchRevisionChanged
+			}
 			return &Error{Code: "dispatch_policy_denied", Message: "prepared credential is no longer authorized"}
 		}
 	}
-	m.mu.RLock()
-	live := sameRevision(account, m.auths[account.ID])
-	m.mu.RUnlock()
-	if !live {
+	if !m.isLiveRevision(account) {
 		return errDispatchRevisionChanged
 	}
 	return nil
+}
+
+func (m *Manager) isLiveRevision(account *Auth) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return sameRevision(account, m.auths[account.ID])
 }
 
 // retryDispatchSelection reports whether a dispatch gate miss should send selection back to the live credential.

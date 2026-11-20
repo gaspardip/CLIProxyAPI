@@ -638,6 +638,12 @@ func TestLateRefreshUnschedulePreservesReplacement(t *testing.T) {
 }
 
 func TestTerminalUnknownRefreshStaysUnscheduled(t *testing.T) {
+	for _, path := range []string{"force", "worker"} {
+		t.Run(path, func(t *testing.T) { testTerminalUnknownRefreshStaysUnscheduled(t, path) })
+	}
+}
+
+func testTerminalUnknownRefreshStaysUnscheduled(t *testing.T, path string) {
 	ctx := context.Background()
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	defer stopWorker()
@@ -650,8 +656,14 @@ func TestTerminalUnknownRefreshStaysUnscheduled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loop.handleDueAuth(ctx, time.Now(), a.ID)
-	loop.worker(workerCtx)
+	if path == "force" {
+		if _, err := m.ForceRefreshAuth(ctx, a.ID); !codex.IsRefreshOutcomeUnknown(err) {
+			t.Fatalf("unexpected refresh outcome: %v", err)
+		}
+	} else {
+		loop.handleDueAuth(ctx, time.Now(), a.ID)
+		loop.worker(workerCtx)
+	}
 	current, _ := m.GetByID(a.ID)
 	if e.RefreshCalls() != 1 || current.LastError == nil || current.LastError.Code != "refresh_outcome_unknown" {
 		t.Fatal("worker did not record terminal unknown refresh")

@@ -269,3 +269,56 @@ func TestCanceledRefreshDoesNotRescheduleRotatedCredential(t *testing.T) {
 		})
 	}
 }
+
+// revisionDenyingPolicy admits only the live revision, as the gateway's shared-route policy does.
+type revisionDenyingPolicy struct {
+	m        *Manager
+	mu       sync.Mutex
+	onFilter func()
+}
+
+func (p *revisionDenyingPolicy) Pick(_ context.Context, _, _ string, _ exec.Options, auths []*Auth) (*Auth, error) {
+	return auths[0], nil
+}
+func (p *revisionDenyingPolicy) FilterCandidates(_ context.Context, _, _ string, _ exec.Options, auths []*Auth) ([]*Auth, error) {
+	p.mu.Lock()
+	f := p.onFilter
+	p.onFilter = nil
+	p.mu.Unlock()
+	if f != nil {
+		f()
+	}
+	var kept []*Auth
+	for _, a := range auths {
+		if live, ok := p.m.GetByID(a.ID); ok && sameRevision(a, live) {
+			kept = append(kept, a)
+		}
+	}
+	return kept, nil
+}
+
+// A policy that denies the superseded snapshot sends selection back to the live credential.
+func TestDispatchPolicyDenialOfSupersededSnapshotReselects(t *testing.T) {
+	for _, mode := range []string{"execute", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			policy := &revisionDenyingPolicy{}
+			m := NewManager(nil, policy, nil)
+			policy.m = m
+			e := &revisionExecutor{}
+			m.RegisterExecutor(e)
+			a := registerRevisionFixture(t, m, map[string]any{"email": "a@example.com", "access_token": "token-a"})
+			policy.onFilter = func() {
+				replacement := &Auth{ID: a.ID, Provider: a.Provider, Status: StatusActive, Metadata: map[string]any{"email": "a@example.com", "access_token": "token-a2"}}
+				if _, err := m.Update(ctx, replacement); err != nil {
+					t.Error(err)
+				}
+			}
+			err := executeRevisionFixture(m, mode)
+			calls := e.dispatched()
+			if err != nil || len(calls) != 1 || authAccessToken(calls[0]) != "token-a2" {
+				t.Fatalf("denied superseded snapshot did not reselect the live credential: err=%v calls=%d", err, len(calls))
+			}
+		})
+	}
+}

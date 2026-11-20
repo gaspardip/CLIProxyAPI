@@ -166,17 +166,27 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
 	if err != nil {
 		return nil, err
 	}
+	applyClaudeRefreshedTokens(auth, td)
+	return auth, nil
+}
+
+func applyClaudeRefreshedTokens(auth *cliproxyauth.Auth, td *claudeauth.ClaudeTokenData) {
 	claudeauth.EnsureMetadataMap(&auth.Metadata)
 	claudeauth.StoreMetadataValue(&auth.Metadata, "access_token", td.AccessToken)
 	claudeauth.StoreMetadataString(&auth.Metadata, "refresh_token", td.RefreshToken)
-	// Profile fields are optional when token rotation succeeds but the follow-up
-	// profile lookup fails. Never erase the previously resolved credential identity.
 	claudeauth.StoreMetadataString(&auth.Metadata, "email", td.Email)
-	claudeauth.StoreMetadataString(&auth.Metadata, "account_uuid", td.AccountUUID)
-	claudeauth.StoreMetadataString(&auth.Metadata, "organization_uuid", td.OrganizationUUID)
-	claudeauth.StoreMetadataString(&auth.Metadata, "organization_name", td.OrganizationName)
+	if strings.TrimSpace(td.AccountUUID) == "" {
+		// The profile lookup failed, so the new token's account is unverified. Clear the old
+		// identity (empty, not deleted, so token storage cannot restore it); preparation re-fetches it.
+		for _, key := range []string{"account_uuid", "organization_uuid", "organization_name"} {
+			claudeauth.StoreMetadataValue(&auth.Metadata, key, "")
+		}
+	} else {
+		claudeauth.StoreMetadataString(&auth.Metadata, "account_uuid", td.AccountUUID)
+		claudeauth.StoreMetadataString(&auth.Metadata, "organization_uuid", td.OrganizationUUID)
+		claudeauth.StoreMetadataString(&auth.Metadata, "organization_name", td.OrganizationName)
+	}
 	claudeauth.StoreMetadataValue(&auth.Metadata, "expired", td.Expire)
 	claudeauth.StoreMetadataValue(&auth.Metadata, "type", "claude")
 	claudeauth.StoreMetadataValue(&auth.Metadata, "last_refresh", time.Now().Format(time.RFC3339))
-	return auth, nil
 }
