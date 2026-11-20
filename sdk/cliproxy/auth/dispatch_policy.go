@@ -33,9 +33,6 @@ func (m *Manager) validateDispatchAuth(ctx context.Context, model string, opts c
 	m.mu.RUnlock()
 	if filter, ok := selector.(CandidateFilter); ok {
 		candidates, err := filter.FilterCandidates(ctx, "mixed", model, opts, []*Auth{account.Clone()})
-		if err != nil {
-			return err
-		}
 		authorized := false
 		for _, candidate := range candidates {
 			if candidate != nil && candidate.ID == account.ID && candidate.Provider == account.Provider && candidate.RegistrationEpoch == account.RegistrationEpoch && candidate.CredentialVersion == account.CredentialVersion && candidate.Generation == account.Generation {
@@ -43,10 +40,14 @@ func (m *Manager) validateDispatchAuth(ctx context.Context, model string, opts c
 				break
 			}
 		}
-		if !authorized {
-			// A policy may deny a snapshot only because it was superseded; selection then retries on the live revision.
-			if !m.isLiveRevision(account) {
+		if err != nil || !authorized {
+			// A policy may deny (or report no quota for) a snapshot only because it was superseded;
+			// selection then retries on the live revision.
+			if ctx.Err() == nil && !m.isLiveRevision(account) {
 				return errDispatchRevisionChanged
+			}
+			if err != nil {
+				return err
 			}
 			return &Error{Code: "dispatch_policy_denied", Message: "prepared credential is no longer authorized"}
 		}

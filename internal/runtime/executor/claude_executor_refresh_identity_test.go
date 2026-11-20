@@ -16,6 +16,7 @@ func TestClaudeRefreshWithoutProfileDropsAccountIdentity(t *testing.T) {
 		wantOrgName, wantEmail string
 	}{
 		{name: "profile-failed", td: claudeauth.ClaudeTokenData{AccessToken: "fixture-new", RefreshToken: "fixture-refresh-new"}, wantEmail: "a@example.com"},
+		{name: "profile-without-org", td: claudeauth.ClaudeTokenData{AccessToken: "fixture-new", RefreshToken: "fixture-refresh-new", AccountUUID: "account-b"}, wantAccount: "account-b", wantEmail: "a@example.com"},
 		{name: "profile-verified", td: claudeauth.ClaudeTokenData{AccessToken: "fixture-new", RefreshToken: "fixture-refresh-new", Email: "b@example.com", AccountUUID: "account-b", OrganizationUUID: "org-b", OrganizationName: "Org B"}, wantAccount: "account-b", wantOrg: "org-b", wantOrgName: "Org B", wantEmail: "b@example.com"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

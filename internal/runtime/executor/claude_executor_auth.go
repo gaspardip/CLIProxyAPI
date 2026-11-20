@@ -175,17 +175,12 @@ func applyClaudeRefreshedTokens(auth *cliproxyauth.Auth, td *claudeauth.ClaudeTo
 	claudeauth.StoreMetadataValue(&auth.Metadata, "access_token", td.AccessToken)
 	claudeauth.StoreMetadataString(&auth.Metadata, "refresh_token", td.RefreshToken)
 	claudeauth.StoreMetadataString(&auth.Metadata, "email", td.Email)
-	if strings.TrimSpace(td.AccountUUID) == "" {
-		// The profile lookup failed, so the new token's account is unverified. Clear the old
-		// identity (empty, not deleted, so token storage cannot restore it); preparation re-fetches it.
-		for _, key := range []string{"account_uuid", "organization_uuid", "organization_name"} {
-			claudeauth.StoreMetadataValue(&auth.Metadata, key, "")
-		}
-	} else {
-		claudeauth.StoreMetadataString(&auth.Metadata, "account_uuid", td.AccountUUID)
-		claudeauth.StoreMetadataString(&auth.Metadata, "organization_uuid", td.OrganizationUUID)
-		claudeauth.StoreMetadataString(&auth.Metadata, "organization_name", td.OrganizationName)
-	}
+	// The identity is the new token's profile, empty when the lookup failed or omitted a field:
+	// an unverified token must not keep the old account. Empty, not deleted, so token storage
+	// cannot restore the old values.
+	claudeauth.StoreMetadataValue(&auth.Metadata, "account_uuid", strings.TrimSpace(td.AccountUUID))
+	claudeauth.StoreMetadataValue(&auth.Metadata, "organization_uuid", strings.TrimSpace(td.OrganizationUUID))
+	claudeauth.StoreMetadataValue(&auth.Metadata, "organization_name", td.OrganizationName)
 	claudeauth.StoreMetadataValue(&auth.Metadata, "expired", td.Expire)
 	claudeauth.StoreMetadataValue(&auth.Metadata, "type", "claude")
 	claudeauth.StoreMetadataValue(&auth.Metadata, "last_refresh", time.Now().Format(time.RFC3339))

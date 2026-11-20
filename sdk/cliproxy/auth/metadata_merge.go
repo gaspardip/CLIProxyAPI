@@ -76,6 +76,15 @@ func MergeRefreshedAuth(base, current, updated *Auth) *Auth {
 	if merged == nil || current == nil || updated == nil {
 		return merged
 	}
+	// Account identity belongs to the bearer that resolved it: a rotated token keeps the refresh's
+	// identity fields, even empty ones, rather than profile data found for the previous token.
+	if base == nil || !reflect.DeepEqual(base.Metadata["access_token"], updated.Metadata["access_token"]) {
+		for _, key := range []string{"account_uuid", "organization_uuid"} {
+			if value, ok := updated.Metadata[key]; ok {
+				merged.Metadata[key] = value
+			}
+		}
+	}
 	if base != nil && current.RegistrationEpoch != base.RegistrationEpoch {
 		return merged
 	}

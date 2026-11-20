@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -99,48 +100,64 @@ func executeRevisionFixture(m *Manager, mode string) error {
 	return err
 }
 
-// Finding 1: a refresh snapshotted before profile discovery must not pair another
-// account's token with the profile preparation discovered meanwhile.
+// Finding 1: a refresh snapshotted before profile discovery must not pair its token with the
+// profile preparation discovered meanwhile, whether the refresh resolved another account or none.
 func TestRefreshCannotPairForeignTokenWithDiscoveredProfile(t *testing.T) {
-	for _, mode := range []string{"execute", "stream"} {
-		t.Run(mode, func(t *testing.T) {
-			ctx := context.Background()
-			m := NewManager(nil, nil, nil)
-			entered, release := make(chan struct{}), make(chan struct{})
-			e := &revisionExecutor{
-				shouldPrepare: func(a *Auth) bool { return authMetadataString(a, "account_uuid") == "" },
-				prepare: func(a *Auth) *Auth {
-					a.Metadata["account_uuid"] = "account-a"
-					a.Metadata["organization_uuid"] = "org-a"
-					return a
-				},
-				refresh: func(a *Auth) (*Auth, error) {
-					close(entered)
-					<-release
-					a.Metadata["access_token"] = "token-b"
-					a.Metadata["account_uuid"] = "account-b"
-					a.Metadata["organization_uuid"] = "org-b"
-					return a, nil
-				},
-			}
-			m.RegisterExecutor(e)
-			a := registerRevisionFixture(t, m, map[string]any{"access_token": "token-a", "refresh_token": "fixture-refresh"})
-			refreshed := make(chan struct{})
-			go func() { _, _ = m.ForceRefreshAuth(ctx, a.ID); close(refreshed) }()
-			<-entered
-			if _, err := m.PrepareRequestAuth(ctx, e, a); err != nil {
-				t.Fatal(err)
-			}
-			close(release)
-			<-refreshed
-			_ = executeRevisionFixture(m, mode)
-			live, _ := m.GetByID(a.ID)
-			for _, view := range append(e.dispatched(), live) {
-				if authAccessToken(view) == "token-b" && (authMetadataString(view, "account_uuid") != "account-b" || authMetadataString(view, "organization_uuid") != "org-b") {
-					t.Fatal("account B's token was paired with account A's profile")
+	for _, tc := range []struct {
+		name                       string
+		initial                    map[string]any
+		refreshAccount, refreshOrg string
+	}{
+		{name: "other-account", initial: map[string]any{}, refreshAccount: "account-b", refreshOrg: "org-b"},
+		{name: "failed-profile", initial: map[string]any{}},
+		{name: "failed-profile-cleared-base", initial: map[string]any{"account_uuid": "", "organization_uuid": ""}},
+	} {
+		for _, mode := range []string{"execute", "stream"} {
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				ctx := context.Background()
+				m := NewManager(nil, nil, nil)
+				entered, release := make(chan struct{}), make(chan struct{})
+				e := &revisionExecutor{
+					shouldPrepare: func(a *Auth) bool {
+						return authMetadataString(a, "account_uuid") == "" && authAccessToken(a) == "token-a"
+					},
+					prepare: func(a *Auth) *Auth {
+						a.Metadata["account_uuid"] = "account-a"
+						a.Metadata["organization_uuid"] = "org-a"
+						return a
+					},
+					refresh: func(a *Auth) (*Auth, error) {
+						close(entered)
+						<-release
+						a.Metadata["access_token"] = "token-b"
+						a.Metadata["account_uuid"] = tc.refreshAccount
+						a.Metadata["organization_uuid"] = tc.refreshOrg
+						return a, nil
+					},
 				}
-			}
-		})
+				m.RegisterExecutor(e)
+				metadata := map[string]any{"access_token": "token-a", "refresh_token": "fixture-refresh"}
+				for k, v := range tc.initial {
+					metadata[k] = v
+				}
+				a := registerRevisionFixture(t, m, metadata)
+				refreshed := make(chan struct{})
+				go func() { _, _ = m.ForceRefreshAuth(ctx, a.ID); close(refreshed) }()
+				<-entered
+				if _, err := m.PrepareRequestAuth(ctx, e, a); err != nil {
+					t.Fatal(err)
+				}
+				close(release)
+				<-refreshed
+				_ = executeRevisionFixture(m, mode)
+				live, _ := m.GetByID(a.ID)
+				for _, view := range append(e.dispatched(), live) {
+					if authAccessToken(view) == "token-b" && (authMetadataString(view, "account_uuid") != tc.refreshAccount || authMetadataString(view, "organization_uuid") != tc.refreshOrg) {
+						t.Fatalf("token-b paired with account %q org %q, want %q %q", authMetadataString(view, "account_uuid"), authMetadataString(view, "organization_uuid"), tc.refreshAccount, tc.refreshOrg)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -275,6 +292,7 @@ type revisionDenyingPolicy struct {
 	m        *Manager
 	mu       sync.Mutex
 	onFilter func()
+	denyErr  error // returned when every candidate is excluded, as the gateway's quota errors are
 }
 
 func (p *revisionDenyingPolicy) Pick(_ context.Context, _, _ string, _ exec.Options, auths []*Auth) (*Auth, error) {
@@ -294,31 +312,39 @@ func (p *revisionDenyingPolicy) FilterCandidates(_ context.Context, _, _ string,
 			kept = append(kept, a)
 		}
 	}
+	if len(kept) == 0 && p.denyErr != nil {
+		return nil, p.denyErr
+	}
 	return kept, nil
 }
 
 // A policy that denies the superseded snapshot sends selection back to the live credential.
 func TestDispatchPolicyDenialOfSupersededSnapshotReselects(t *testing.T) {
-	for _, mode := range []string{"execute", "stream"} {
-		t.Run(mode, func(t *testing.T) {
-			ctx := context.Background()
-			policy := &revisionDenyingPolicy{}
-			m := NewManager(nil, policy, nil)
-			policy.m = m
-			e := &revisionExecutor{}
-			m.RegisterExecutor(e)
-			a := registerRevisionFixture(t, m, map[string]any{"email": "a@example.com", "access_token": "token-a"})
-			policy.onFilter = func() {
-				replacement := &Auth{ID: a.ID, Provider: a.Provider, Status: StatusActive, Metadata: map[string]any{"email": "a@example.com", "access_token": "token-a2"}}
-				if _, err := m.Update(ctx, replacement); err != nil {
-					t.Error(err)
+	for _, tc := range []struct {
+		name    string
+		denyErr error
+	}{{name: "empty"}, {name: "quota-error", denyErr: errors.New("no eligible quota")}} {
+		for _, mode := range []string{"execute", "stream"} {
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				ctx := context.Background()
+				policy := &revisionDenyingPolicy{denyErr: tc.denyErr}
+				m := NewManager(nil, policy, nil)
+				policy.m = m
+				e := &revisionExecutor{}
+				m.RegisterExecutor(e)
+				a := registerRevisionFixture(t, m, map[string]any{"email": "a@example.com", "access_token": "token-a"})
+				policy.onFilter = func() {
+					replacement := &Auth{ID: a.ID, Provider: a.Provider, Status: StatusActive, Metadata: map[string]any{"email": "a@example.com", "access_token": "token-a2"}}
+					if _, err := m.Update(ctx, replacement); err != nil {
+						t.Error(err)
+					}
 				}
-			}
-			err := executeRevisionFixture(m, mode)
-			calls := e.dispatched()
-			if err != nil || len(calls) != 1 || authAccessToken(calls[0]) != "token-a2" {
-				t.Fatalf("denied superseded snapshot did not reselect the live credential: err=%v calls=%d", err, len(calls))
-			}
-		})
+				err := executeRevisionFixture(m, mode)
+				calls := e.dispatched()
+				if err != nil || len(calls) != 1 || authAccessToken(calls[0]) != "token-a2" {
+					t.Fatalf("denied superseded snapshot did not reselect the live credential: err=%v calls=%d", err, len(calls))
+				}
+			})
+		}
 	}
 }
