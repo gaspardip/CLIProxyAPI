@@ -914,6 +914,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	defer releaseMutation()
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		if selected, ok := ctx.Value(dispatchProviderContextKey{}).(*Auth); ok && !sameCredentialOwner(selected, auth) {
+			m.mu.Unlock()
+			return
+		}
 		if isStaleExecutionResult(result, auth) {
 			staleEpoch := result.RegistrationEpoch > 0 && result.RegistrationEpoch < auth.RegistrationEpoch
 			if !staleEpoch && rejectsToken && result.AccessToken != "" {
@@ -1446,6 +1450,12 @@ func (m *Manager) recordExecutionResult(ctx context.Context, result Result, auth
 		}
 	}
 	if !ephemeral {
+		if auth != nil {
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			ctx = context.WithValue(ctx, dispatchProviderContextKey{}, auth.Clone())
+		}
 		m.MarkResult(ctx, result)
 		return
 	}
@@ -1476,6 +1486,12 @@ func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Re
 	defer releaseMutation()
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+		if ctx != nil {
+			if selected, ok := ctx.Value(dispatchProviderContextKey{}).(*Auth); ok && !sameCredentialOwner(selected, auth) {
+				m.mu.Unlock()
+				return
+			}
+		}
 		if isStaleExecutionResult(result, auth) {
 			m.mu.Unlock()
 			releaseMutation()

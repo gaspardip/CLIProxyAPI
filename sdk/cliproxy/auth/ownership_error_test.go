@@ -24,8 +24,14 @@ func (e *ownershipConflictExecutor) PrepareRequestAuth(_ context.Context, a *Aut
 	return a, nil
 }
 func (e *ownershipConflictExecutor) Refresh(_ context.Context, a *Auth) (*Auth, error) {
-	if e.stage == "refresh" {
+	if e.stage == "refresh" || e.stage == "refresh-error" || e.stage == "refresh-cancel" {
 		e.replace()
+	}
+	if e.stage == "refresh-cancel" {
+		return nil, context.Canceled
+	}
+	if e.stage == "refresh-error" || e.stage == "result" {
+		return nil, fmt.Errorf("fixture refresh failed")
 	}
 	a = a.Clone()
 	a.Metadata["access_token"] = "renewed"
@@ -34,7 +40,7 @@ func (e *ownershipConflictExecutor) Refresh(_ context.Context, a *Auth) (*Auth, 
 
 func TestOwnershipConflictLeavesReplacementUnchanged(t *testing.T) {
 	for _, mode := range []string{"execute", "count", "stream", "bootstrap"} {
-		for _, stage := range []string{"prepare", "refresh", "before-refresh"} {
+		for _, stage := range []string{"prepare", "refresh", "before-refresh", "refresh-error", "refresh-cancel", "result"} {
 			if mode == "bootstrap" && stage == "prepare" {
 				continue
 			}
@@ -75,6 +81,9 @@ func TestOwnershipConflictLeavesReplacementUnchanged(t *testing.T) {
 				if stage == "before-refresh" {
 					e.onBoundary = replace
 				}
+				if stage == "result" {
+					m.SetResultPolicy(ResultPolicyFunc(func(_ context.Context, r Result) Result { replace(); return r }))
+				}
 				m.RegisterExecutor(e)
 				req := exec.Request{Model: "fixture-model"}
 				switch mode {
@@ -110,6 +119,51 @@ func TestOwnershipConflictLeavesReplacementUnchanged(t *testing.T) {
 					t.Error("old request persisted replacement cooldown")
 				}
 			})
+		}
+	}
+}
+
+type ownershipSaveStore struct {
+	requestPrepareStore
+	beforeSave func()
+}
+
+func (s *ownershipSaveStore) Save(ctx context.Context, a *Auth) (string, error) {
+	if s.beforeSave != nil {
+		s.beforeSave()
+	}
+	return s.requestPrepareStore.Save(ctx, a)
+}
+
+func TestReplacementSaveDoesNotAdoptOldOwnerRefreshFailure(t *testing.T) {
+	ctx := context.Background()
+	store := &ownershipSaveStore{}
+	m := NewManager(store, nil, nil)
+	m.RegisterExecutor(&unauthorizedRefreshExecutor{id: "antigravity", refreshErr: fmt.Errorf("fixture refresh failed")})
+	base, err := m.Register(ctx, &Auth{ID: "fixture", Provider: "antigravity", Status: StatusActive, Metadata: map[string]any{"email": "old@example.com", "access_token": "unchanged-token", "refresh_token": "fixture-refresh"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	store.beforeSave = func() { close(entered); <-release }
+	replacement := base.Clone()
+	replacement.Metadata["email"] = "new@example.com"
+	done := make(chan error, 1)
+	go func() { _, err := m.Update(ctx, replacement); done <- err }()
+	<-entered
+	// Runtime failure recording must remain live while the independent save is blocked.
+	_, refreshErr := m.ForceRefreshAuth(ctx, base.ID)
+	close(release)
+	if refreshErr == nil {
+		t.Error("refresh failure not exercised")
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	current, _ := m.GetByID(base.ID)
+	for _, a := range []*Auth{current, store.lastAuth()} {
+		if authMetadataString(a, "email") != "new@example.com" || a.LastError != nil || a.RefreshError != nil || a.Unavailable || a.Status != StatusActive {
+			t.Error("replacement adopted old owner's runtime failure")
 		}
 	}
 }

@@ -1228,7 +1228,7 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string, expected
 	defer releaseMutation()
 	m.mu.Lock()
 	current := m.auths[id]
-	if expected != nil && (!sameDispatchProvider(expected, current) || expected.RegistrationEpoch != current.RegistrationEpoch || credentialAccountChanged(expected, current, true)) {
+	if expected != nil && !sameCredentialOwner(expected, current) {
 		m.mu.Unlock()
 		return errCredentialOwnershipChanged
 	}
@@ -1286,7 +1286,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		exec, _ = m.executorLocked(executorKeyFromAuth(auth))
 	}
 	m.mu.RUnlock()
-	if selected, ok := ctx.Value(dispatchProviderContextKey{}).(*Auth); ok && (!sameDispatchProvider(selected, auth) || selected.RegistrationEpoch != auth.RegistrationEpoch || credentialAccountChanged(selected, auth, true)) {
+	if selected, ok := ctx.Value(dispatchProviderContextKey{}).(*Auth); ok && !sameCredentialOwner(selected, auth) {
 		return nil, errCredentialOwnershipChanged
 	}
 	if auth == nil || exec == nil {
@@ -1330,6 +1330,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 			shouldReschedule := false
 			shouldUnschedule := false
 			m.mu.Lock()
+			if !sameCredentialOwner(auth, m.auths[id]) {
+				m.mu.Unlock()
+				return nil, errCredentialOwnershipChanged
+			}
 			if current := m.auths[id]; current != nil &&
 				current.RegistrationEpoch == auth.RegistrationEpoch &&
 				current.CredentialVersion == auth.CredentialVersion &&
@@ -1364,6 +1368,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		}
 		// Access token has expired (or was rejected by a 401) while refresh grant remains terminally rejected.
 		m.mu.Lock()
+		if !sameCredentialOwner(auth, m.auths[id]) {
+			m.mu.Unlock()
+			return nil, errCredentialOwnershipChanged
+		}
 		if current := m.auths[id]; current != nil &&
 			current.RegistrationEpoch == auth.RegistrationEpoch &&
 			current.CredentialVersion == auth.CredentialVersion &&
@@ -1409,7 +1417,7 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	base := auth.Clone()
 	updated, err := exec.Refresh(ctx, base.Clone())
 	if updated != nil && !sameDispatchProvider(base, updated) {
-		return nil, errors.New("credential provider changed during refresh")
+		return nil, errCredentialOwnershipChanged
 	}
 	now := time.Now()
 	refreshCanceled := (errors.Is(err, context.Canceled) || errors.Is(err, codex.ErrSIWCRefreshDeferred)) && !codex.IsRefreshOutcomeUnknown(err)
@@ -1430,6 +1438,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if refreshCanceled {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
 		m.mu.Lock()
+		if !sameCredentialOwner(base, m.auths[id]) {
+			m.mu.Unlock()
+			return nil, errCredentialOwnershipChanged
+		}
 		if current := m.auths[id]; current != nil {
 			if current.NextRefreshAfter.IsZero() || current.NextRefreshAfter.Before(now) {
 				current.NextRefreshAfter = now.Add(time.Second)
@@ -1469,6 +1481,10 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 		isDisabled := false
 		shouldUnschedule := false
 		m.mu.Lock()
+		if !sameCredentialOwner(base, m.auths[id]) {
+			m.mu.Unlock()
+			return nil, errCredentialOwnershipChanged
+		}
 		if current := m.auths[id]; current != nil {
 			if base != nil && (current.RegistrationEpoch != base.RegistrationEpoch || current.CredentialVersion != base.CredentialVersion || secretGrantChanged(base, current)) {
 				m.mu.Unlock()

@@ -40,4 +40,8 @@ func sameDispatchProvider(selected, current *Auth) bool {
 	return selected != nil && current != nil && selected.ID == current.ID && selected.Provider == current.Provider && executorKeyFromAuth(selected) == executorKeyFromAuth(current)
 }
 
+func sameCredentialOwner(selected, current *Auth) bool {
+	return sameDispatchProvider(selected, current) && selected.RegistrationEpoch == current.RegistrationEpoch && !credentialAccountChanged(selected, current, true)
+}
+
 type dispatchProviderContextKey struct{}

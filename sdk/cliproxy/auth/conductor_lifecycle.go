@@ -322,11 +322,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 	}
 	if mode == updateModePrepare || mode == updateModeRefresh {
 		// The mutation gate and manager lock must protect ownership before any merge or publication.
-		if base == nil || !sameDispatchProvider(base, existing) || !sameDispatchProvider(base, auth) || credentialAccountChanged(base, existing, true) {
-			m.mu.Unlock()
-			return nil, false, false, errCredentialOwnershipChanged
-		}
-		if existing.RegistrationEpoch != base.RegistrationEpoch {
+		if !sameCredentialOwner(base, existing) || !sameDispatchProvider(base, auth) {
 			m.mu.Unlock()
 			return nil, false, false, errCredentialOwnershipChanged
 		}
@@ -575,43 +571,46 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 		m.mu.Unlock()
 		return nil, false, false, fmt.Errorf("auth %s changed registration during persistence", auth.ID)
 	}
-	mergeAuthSaveDelta(auth, existingBeforeSave, existing, false)
-	if (auth.RejectedAccessToken == "" && existing.RejectedAccessToken != "") || (auth.RejectedSIWCAccessToken == "" && existing.RejectedSIWCAccessToken != "") {
-		probe := auth.Clone()
-		probe.CodexRefreshPatch = refreshPatchBeforeSave
-		applyPreservedRejectedTokens(existing, probe, mode == updateModeRefresh)
-		auth.RejectedAccessToken = probe.RejectedAccessToken
-		auth.RejectedSIWCAccessToken = probe.RejectedSIWCAccessToken
-	}
-	if existing.RequiresSignIn != existingBeforeSave.RequiresSignIn ||
-		!equalErrorPtr(existing.RefreshError, existingBeforeSave.RefreshError) ||
-		existing.RejectedRefreshToken != existingBeforeSave.RejectedRefreshToken ||
-		existing.RejectedSIWCRefreshToken != existingBeforeSave.RejectedSIWCRefreshToken ||
-		existing.RenewalWarnedRefreshToken != existingBeforeSave.RenewalWarnedRefreshToken ||
-		!existing.RenewalEventAt.Equal(existingBeforeSave.RenewalEventAt) ||
-		existing.InferenceVerified != existingBeforeSave.InferenceVerified ||
-		!existing.LastInferenceVerifiedAt.Equal(existingBeforeSave.LastInferenceVerifiedAt) ||
-		existing.RenewalVerified != existingBeforeSave.RenewalVerified ||
-		!existing.LastRenewalVerifiedAt.Equal(existingBeforeSave.LastRenewalVerifiedAt) {
-		probe := auth.Clone()
-		probe.CodexRefreshPatch = refreshPatchBeforeSave
-		applyPreservedRenewalState(existing, probe, mode, now)
-		auth.RequiresSignIn = probe.RequiresSignIn
-		auth.RefreshError = probe.RefreshError
-		auth.RejectedRefreshToken = probe.RejectedRefreshToken
-		auth.RejectedSIWCRefreshToken = probe.RejectedSIWCRefreshToken
-		auth.RenewalWarnedRefreshToken = probe.RenewalWarnedRefreshToken
-		auth.RenewalEventAt = probe.RenewalEventAt
-		auth.AdoptedAt = probe.AdoptedAt
-		auth.AdoptedGrantHash = probe.AdoptedGrantHash
-		auth.InferenceVerified = probe.InferenceVerified
-		auth.LastInferenceVerifiedAt = probe.LastInferenceVerifiedAt
-		auth.RenewalVerified = probe.RenewalVerified
-		auth.LastRenewalVerifiedAt = probe.LastRenewalVerifiedAt
-		if authHasUnchangedRejectedRefreshToken(auth) && !existingBeforeSave.RequiresSignIn {
-			if exp, okExp := auth.AccessTokenExpirationTime(); okExp && !exp.IsZero() && exp.After(now) {
-				if auth.NextRefreshAfter.IsZero() || auth.NextRefreshAfter.Before(exp) {
-					auth.NextRefreshAfter = exp
+	// Runtime changes during Save belong only to the original account.
+	if sameCredentialOwner(existingBeforeSave, auth) {
+		mergeAuthSaveDelta(auth, existingBeforeSave, existing, false)
+		if (auth.RejectedAccessToken == "" && existing.RejectedAccessToken != "") || (auth.RejectedSIWCAccessToken == "" && existing.RejectedSIWCAccessToken != "") {
+			probe := auth.Clone()
+			probe.CodexRefreshPatch = refreshPatchBeforeSave
+			applyPreservedRejectedTokens(existing, probe, mode == updateModeRefresh)
+			auth.RejectedAccessToken = probe.RejectedAccessToken
+			auth.RejectedSIWCAccessToken = probe.RejectedSIWCAccessToken
+		}
+		if existing.RequiresSignIn != existingBeforeSave.RequiresSignIn ||
+			!equalErrorPtr(existing.RefreshError, existingBeforeSave.RefreshError) ||
+			existing.RejectedRefreshToken != existingBeforeSave.RejectedRefreshToken ||
+			existing.RejectedSIWCRefreshToken != existingBeforeSave.RejectedSIWCRefreshToken ||
+			existing.RenewalWarnedRefreshToken != existingBeforeSave.RenewalWarnedRefreshToken ||
+			!existing.RenewalEventAt.Equal(existingBeforeSave.RenewalEventAt) ||
+			existing.InferenceVerified != existingBeforeSave.InferenceVerified ||
+			!existing.LastInferenceVerifiedAt.Equal(existingBeforeSave.LastInferenceVerifiedAt) ||
+			existing.RenewalVerified != existingBeforeSave.RenewalVerified ||
+			!existing.LastRenewalVerifiedAt.Equal(existingBeforeSave.LastRenewalVerifiedAt) {
+			probe := auth.Clone()
+			probe.CodexRefreshPatch = refreshPatchBeforeSave
+			applyPreservedRenewalState(existing, probe, mode, now)
+			auth.RequiresSignIn = probe.RequiresSignIn
+			auth.RefreshError = probe.RefreshError
+			auth.RejectedRefreshToken = probe.RejectedRefreshToken
+			auth.RejectedSIWCRefreshToken = probe.RejectedSIWCRefreshToken
+			auth.RenewalWarnedRefreshToken = probe.RenewalWarnedRefreshToken
+			auth.RenewalEventAt = probe.RenewalEventAt
+			auth.AdoptedAt = probe.AdoptedAt
+			auth.AdoptedGrantHash = probe.AdoptedGrantHash
+			auth.InferenceVerified = probe.InferenceVerified
+			auth.LastInferenceVerifiedAt = probe.LastInferenceVerifiedAt
+			auth.RenewalVerified = probe.RenewalVerified
+			auth.LastRenewalVerifiedAt = probe.LastRenewalVerifiedAt
+			if authHasUnchangedRejectedRefreshToken(auth) && !existingBeforeSave.RequiresSignIn {
+				if exp, okExp := auth.AccessTokenExpirationTime(); okExp && !exp.IsZero() && exp.After(now) {
+					if auth.NextRefreshAfter.IsZero() || auth.NextRefreshAfter.Before(exp) {
+						auth.NextRefreshAfter = exp
+					}
 				}
 			}
 		}
