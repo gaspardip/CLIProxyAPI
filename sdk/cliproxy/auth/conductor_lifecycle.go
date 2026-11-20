@@ -432,7 +432,7 @@ func (m *Manager) updateInternalLocked(ctx context.Context, base, auth *Auth, mo
 			auth.Quota.Signals = observation.Signals
 			auth.cooldownRecordedSeq = existing.cooldownRecordedSeq
 		}
-		if credChanged || mode == updateModeRefresh {
+		if credChanged || mode == updateModeRefresh || !sameCredentialOwner(existing, auth) {
 			applyPreservedRejectedTokens(existing, auth, mode == updateModeRefresh)
 			applyPreservedRenewalState(existing, auth, mode, now)
 			if auth.RejectedAccessToken == "" || authAccessToken(auth) != auth.RejectedAccessToken {
