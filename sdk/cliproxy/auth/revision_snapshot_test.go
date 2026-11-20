@@ -15,6 +15,7 @@ import (
 
 // revisionExecutor records every dispatched credential; hooks race other writers against it.
 type revisionExecutor struct {
+	provider      string // defaults to antigravity
 	mu            sync.Mutex
 	calls         []*Auth
 	shouldPrepare func(*Auth) bool
@@ -23,7 +24,12 @@ type revisionExecutor struct {
 	execute       func(*Auth) error
 }
 
-func (*revisionExecutor) Identifier() string { return "antigravity" }
+func (e *revisionExecutor) Identifier() string {
+	if e.provider != "" {
+		return e.provider
+	}
+	return "antigravity"
+}
 func (e *revisionExecutor) ShouldPrepareRequestAuth(a *Auth) bool {
 	return e.shouldPrepare != nil && e.shouldPrepare(a)
 }
@@ -71,7 +77,12 @@ func (e *revisionExecutor) dispatched() []*Auth {
 
 func registerRevisionFixture(t *testing.T, m *Manager, metadata map[string]any) *Auth {
 	t.Helper()
-	a, err := m.Register(context.Background(), &Auth{ID: t.Name(), Provider: "antigravity", Status: StatusActive, Metadata: metadata})
+	return registerRevisionFixtureAs(t, m, "antigravity", metadata)
+}
+
+func registerRevisionFixtureAs(t *testing.T, m *Manager, provider string, metadata map[string]any) *Auth {
+	t.Helper()
+	a, err := m.Register(context.Background(), &Auth{ID: t.Name(), Provider: provider, Status: StatusActive, Metadata: metadata})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,13 +93,17 @@ func registerRevisionFixture(t *testing.T, m *Manager, metadata map[string]any) 
 }
 
 func executeRevisionFixture(m *Manager, mode string) error {
+	return executeRevisionFixtureAs(m, "antigravity", mode)
+}
+
+func executeRevisionFixtureAs(m *Manager, provider, mode string) error {
 	ctx := context.Background()
 	req := exec.Request{Model: "fixture-model"}
 	if mode == "execute" {
-		_, err := m.Execute(ctx, []string{"antigravity"}, req, exec.Options{})
+		_, err := m.Execute(ctx, []string{provider}, req, exec.Options{})
 		return err
 	}
-	result, err := m.ExecuteStream(ctx, []string{"antigravity"}, req, exec.Options{})
+	result, err := m.ExecuteStream(ctx, []string{provider}, req, exec.Options{})
 	if err != nil {
 		return err
 	}
@@ -118,6 +133,7 @@ func TestRefreshCannotPairForeignTokenWithDiscoveredProfile(t *testing.T) {
 				m := NewManager(nil, nil, nil)
 				entered, release := make(chan struct{}), make(chan struct{})
 				e := &revisionExecutor{
+					provider: "claude",
 					shouldPrepare: func(a *Auth) bool {
 						return authMetadataString(a, "account_uuid") == "" && authAccessToken(a) == "token-a"
 					},
@@ -140,7 +156,7 @@ func TestRefreshCannotPairForeignTokenWithDiscoveredProfile(t *testing.T) {
 				for k, v := range tc.initial {
 					metadata[k] = v
 				}
-				a := registerRevisionFixture(t, m, metadata)
+				a := registerRevisionFixtureAs(t, m, "claude", metadata)
 				refreshed := make(chan struct{})
 				go func() { _, _ = m.ForceRefreshAuth(ctx, a.ID); close(refreshed) }()
 				<-entered
@@ -149,7 +165,7 @@ func TestRefreshCannotPairForeignTokenWithDiscoveredProfile(t *testing.T) {
 				}
 				close(release)
 				<-refreshed
-				_ = executeRevisionFixture(m, mode)
+				_ = executeRevisionFixtureAs(m, "claude", mode)
 				live, _ := m.GetByID(a.ID)
 				for _, view := range append(e.dispatched(), live) {
 					if authAccessToken(view) == "token-b" && (authMetadataString(view, "account_uuid") != tc.refreshAccount || authMetadataString(view, "organization_uuid") != tc.refreshOrg) {
@@ -323,7 +339,13 @@ func TestDispatchPolicyDenialOfSupersededSnapshotReselects(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		denyErr error
-	}{{name: "empty"}, {name: "quota-error", denyErr: errors.New("no eligible quota")}} {
+		wantErr error // the filter's own cancellation is returned, not retried
+	}{
+		{name: "empty"},
+		{name: "quota-error", denyErr: errors.New("no eligible quota")},
+		{name: "filter-canceled", denyErr: context.Canceled, wantErr: context.Canceled},
+		{name: "filter-deadline", denyErr: fmt.Errorf("quota poll: %w", context.DeadlineExceeded), wantErr: context.DeadlineExceeded},
+	} {
 		for _, mode := range []string{"execute", "stream"} {
 			t.Run(tc.name+"/"+mode, func(t *testing.T) {
 				ctx := context.Background()
@@ -341,6 +363,12 @@ func TestDispatchPolicyDenialOfSupersededSnapshotReselects(t *testing.T) {
 				}
 				err := executeRevisionFixture(m, mode)
 				calls := e.dispatched()
+				if tc.wantErr != nil {
+					if !errors.Is(err, tc.wantErr) || len(calls) != 0 {
+						t.Fatalf("filter cancellation was retried: err=%v calls=%d", err, len(calls))
+					}
+					return
+				}
 				if err != nil || len(calls) != 1 || authAccessToken(calls[0]) != "token-a2" {
 					t.Fatalf("denied superseded snapshot did not reselect the live credential: err=%v calls=%d", err, len(calls))
 				}

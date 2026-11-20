@@ -218,19 +218,36 @@ func TestMergeRefreshedAuth(t *testing.T) {
 		}
 		updated := &Auth{
 			ID:                "auth5",
+			Provider:          "claude",
 			RegistrationEpoch: 1,
-			Metadata:          map[string]any{"access_token": "refreshed-epoch-1-token"},
+			Metadata:          map[string]any{"access_token": "refreshed-epoch-1-token", "account_uuid": "epoch-1-account"},
 		}
 
+		if merged := MergeRefreshedAuth(base, &Auth{ID: "auth5", Provider: "claude", RegistrationEpoch: 2}, updated); merged == nil || merged.Metadata["account_uuid"] != nil {
+			t.Fatalf("stale refresh stamped identity onto a replacement without metadata: %#v", merged)
+		}
 		merged := MergeRefreshedAuth(base, current, updated)
 		if merged == nil {
 			t.Fatal("merged is nil")
+		}
+		if _, ok := merged.Metadata["account_uuid"]; ok {
+			t.Fatalf("stale refresh stamped identity onto the replacement: %#v", merged.Metadata)
 		}
 		if merged.RegistrationEpoch != 2 {
 			t.Fatalf("RegistrationEpoch = %d, want 2", merged.RegistrationEpoch)
 		}
 		if got, _ := merged.Metadata["access_token"].(string); got != "new-epoch-2-token" {
 			t.Fatalf("Metadata[access_token] = %q, want new-epoch-2-token", got)
+		}
+	})
+
+	t.Run("non-Claude rotation keeps a concurrently cleared account_uuid cleared", func(t *testing.T) {
+		base := &Auth{ID: "auth-ag", Provider: "antigravity", Metadata: map[string]any{"access_token": "token-a", "account_uuid": "custom"}}
+		current := &Auth{ID: "auth-ag", Provider: "antigravity", Metadata: map[string]any{"access_token": "token-a"}}
+		updated := &Auth{ID: "auth-ag", Provider: "antigravity", Metadata: map[string]any{"access_token": "token-b", "account_uuid": "custom"}}
+		merged := MergeRefreshedAuth(base, current, updated)
+		if _, ok := merged.Metadata["account_uuid"]; ok || merged.Metadata["access_token"] != "token-b" {
+			t.Fatalf("metadata = %#v, want token-b without account_uuid", merged.Metadata)
 		}
 	})
 

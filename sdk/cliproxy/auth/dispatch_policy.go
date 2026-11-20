@@ -40,6 +40,9 @@ func (m *Manager) validateDispatchAuth(ctx context.Context, model string, opts c
 				break
 			}
 		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
 		if err != nil || !authorized {
 			// A policy may deny (or report no quota for) a snapshot only because it was superseded;
 			// selection then retries on the live revision.
