@@ -47,6 +47,13 @@ func MergeExistingAuthMetadata(target *Auth, existingMap map[string]any) {
 				continue
 			}
 		}
+		// Claude identity belongs to the token that resolved it; an old file's UUIDs never fill gaps.
+		if strings.EqualFold(strings.TrimSpace(target.Provider), "claude") {
+			switch CanonicalCredentialMetadataKey(k) {
+			case "account_uuid", "organization_uuid":
+				continue
+			}
+		}
 		if strings.EqualFold(strings.TrimSpace(k), "portal") && targetHadOAuthProvider {
 			continue
 		}

@@ -574,3 +574,27 @@ func TestMergeExistingAuthMetadataPortalAttributionDeterministic(t *testing.T) {
 		t.Fatalf("expected stale portal to be skipped when target defines oauth_provider, got %#v", reloginTarget.Metadata["portal"])
 	}
 }
+
+func TestMergeExistingAuthMetadataClaudeKeepsOnlyTheLoginIdentity(t *testing.T) {
+	// A re-login that resolved only the organization must not inherit the old file's account.
+	target := &Auth{Provider: "claude", Metadata: map[string]any{"email": "a@example.com", "organization_uuid": "org-new"}}
+	MergeExistingAuthMetadata(target, map[string]any{"email": "a@example.com", "account_uuid": "acct-old", "organization_uuid": "org-old", "prefix": "team"})
+
+	if _, ok := target.Metadata["account_uuid"]; ok {
+		t.Fatalf("account_uuid = %v, want absent", target.Metadata["account_uuid"])
+	}
+	if target.Metadata["organization_uuid"] != "org-new" {
+		t.Fatalf("organization_uuid = %v, want org-new", target.Metadata["organization_uuid"])
+	}
+	if target.Metadata["prefix"] != "team" {
+		t.Fatalf("prefix = %v, want team", target.Metadata["prefix"])
+	}
+
+	empty := &Auth{Provider: "claude", Metadata: map[string]any{"email": "a@example.com"}}
+	MergeExistingAuthMetadata(empty, map[string]any{"account_uuid": "acct-old", "organization_uuid": "org-old"})
+	for _, key := range []string{"account_uuid", "organization_uuid"} {
+		if _, ok := empty.Metadata[key]; ok {
+			t.Fatalf("%s = %v, want absent", key, empty.Metadata[key])
+		}
+	}
+}
